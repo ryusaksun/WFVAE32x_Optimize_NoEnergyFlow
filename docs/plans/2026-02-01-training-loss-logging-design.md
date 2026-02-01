@@ -187,7 +187,65 @@ def plot_training_curves(csv_path, output_path, disc_start=20000):
     plt.close()
 ```
 
-### 训练结束时调用
+### 信号处理（捕获训练中断）
+
+```python
+import signal
+import sys
+
+def setup_signal_handlers(global_rank, csv_file, ckpt_dir, args):
+    """设置信号处理器，确保中断时生成图表"""
+    def signal_handler(signum, frame):
+        if global_rank == 0:
+            logger.info(f"Received signal {signum}. Generating plot before exit...")
+            try:
+                csv_file.close()
+            except:
+                pass
+
+            if not args.disable_plot:
+                try:
+                    plot_training_curves(
+                        csv_path=ckpt_dir / "training_losses.csv",
+                        output_path=ckpt_dir / "training_curves_interrupted.png",
+                        disc_start=args.disc_start
+                    )
+                    logger.info(f"Plot saved to {ckpt_dir / 'training_curves_interrupted.png'}")
+                except Exception as e:
+                    logger.error(f"Failed to generate plot: {e}")
+
+        dist.destroy_process_group()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill command
+
+# 在训练开始前调用
+setup_signal_handlers(global_rank, csv_file, ckpt_dir, args)
+```
+
+### 周期性生成图表（Checkpoint 时）
+
+```python
+# 在保存 checkpoint 时同时更新图表
+if current_step % args.save_ckpt_step == 0 and global_rank == 0:
+    file_path = save_checkpoint(...)
+    logger.info(f"Checkpoint has been saved to `{file_path}`.")
+
+    # 生成当前进度的图表
+    if not args.disable_plot:
+        try:
+            plot_training_curves(
+                csv_path=ckpt_dir / "training_losses.csv",
+                output_path=ckpt_dir / "training_curves.png",
+                disc_start=args.disc_start
+            )
+            logger.info(f"Updated training curves plot.")
+        except Exception as e:
+            logger.warning(f"Failed to update plot: {e}")
+```
+
+### 训练正常结束时调用
 
 ```python
 # train() 函数末尾，dist.destroy_process_group() 之前
@@ -195,13 +253,13 @@ if global_rank == 0:
     csv_file.close()
 
     if not args.disable_plot:
-        logger.info("Generating training curves plot...")
+        logger.info("Training completed. Generating final plot...")
         plot_training_curves(
             csv_path=ckpt_dir / "training_losses.csv",
-            output_path=ckpt_dir / "training_curves.png",
+            output_path=ckpt_dir / "training_curves_final.png",
             disc_start=args.disc_start
         )
-        logger.info(f"Plot saved to {ckpt_dir / 'training_curves.png'}")
+        logger.info(f"Final plot saved to {ckpt_dir / 'training_curves_final.png'}")
 
 dist.destroy_process_group()
 ```
@@ -212,19 +270,30 @@ dist.destroy_process_group()
 - 检测已存在的 CSV 文件，以追加模式打开
 - 不重复写入 header
 
-### 2. 依赖缺失
+### 2. 训练中断处理（NEW）
+- 捕获 SIGINT (Ctrl+C) 和 SIGTERM (kill) 信号
+- 中断时自动关闭 CSV 文件并生成图表
+- 图表文件名：`training_curves_interrupted.png`（区分正常结束）
+- 优雅退出，清理分布式资源
+
+### 3. 周期性图表更新（NEW）
+- 每次保存 checkpoint 时更新 `training_curves.png`
+- 可以实时查看训练进度
+- 绘图失败只打印警告，不中断训练
+
+### 4. 依赖缺失
 - 绘图函数内部 try-import
 - 缺失时打印警告但不中断训练
 
-### 3. 数据不足
+### 5. 数据不足
 - 绘图前检查 CSV 行数（需要 ≥2 行）
 - 数据点少于 10 个时跳过平滑处理
 
-### 4. 磁盘 I/O 错误
+### 6. 磁盘 I/O 错误
 - 所有写入操作包裹在 try-except
 - 失败时记录错误但继续训练
 
-### 5. 分布式同步
+### 7. 分布式同步
 - 所有文件 I/O 操作限定在 `global_rank == 0`
 - 避免多进程竞争写入
 
@@ -281,12 +350,19 @@ plot_training_curves(
 results/WFIVAE_1024-lr1e-05-bs2-rs1024/
 ├── checkpoint-20000.ckpt
 ├── checkpoint-40000.ckpt
-├── training_losses.csv          # 实时更新
-├── training_curves.png          # 训练结束时生成（300 DPI）
+├── training_losses.csv                    # 实时更新
+├── training_curves.png                    # 每次保存 checkpoint 时更新
+├── training_curves_final.png              # 训练正常结束时生成
+├── training_curves_interrupted.png        # 训练中断时生成（如果有）
 └── val_images/
     ├── original/
     └── reconstructed/
 ```
+
+**文件说明**：
+- `training_curves.png` - 最新的训练曲线（随 checkpoint 更新）
+- `training_curves_final.png` - 训练完整结束后的最终版本
+- `training_curves_interrupted.png` - 如果训练被 Ctrl+C 中断，保存中断时的状态
 
 ## Expected Performance
 
@@ -299,10 +375,12 @@ results/WFIVAE_1024-lr1e-05-bs2-rs1024/
 
 1. **可追溯性**: CSV 文件独立于 WandB，便于离线分析
 2. **自动化**: 无需手动绘图，训练结束即可查看全局趋势
-3. **诊断性**: 判别器启动标记清楚显示训练阶段转换
-4. **灵活性**: 可配置记录频率，平衡精度和文件大小
-5. **鲁棒性**: 错误处理确保日志失败不影响训练
-6. **可恢复**: 支持断点续训时追加写入
+3. **实时可视化**: 每个 checkpoint 点自动更新图表，可随时查看进度
+4. **中断安全**: Ctrl+C 中断时自动保存图表，不丢失已有数据
+5. **诊断性**: 判别器启动标记清楚显示训练阶段转换
+6. **灵活性**: 可配置记录频率，平衡精度和文件大小
+7. **鲁棒性**: 错误处理确保日志失败不影响训练
+8. **可恢复**: 支持断点续训时追加写入
 
 ## Risks and Mitigations
 
