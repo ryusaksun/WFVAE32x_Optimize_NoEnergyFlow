@@ -1,0 +1,133 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e1f5fe', 'lineColor': '#333'}}}%%
+flowchart TD
+    subgraph Input["Input"]
+        input(["Image<br/>(B, 3, H, W)"])
+    end
+
+    subgraph Encoder["Encoder"]
+        subgraph WaveletDecomp["Wavelet Decomposition"]
+            haar2d_enc["HaarWaveletTransform2D<br/>3 → 12 coeffs<br/>(LL, LH, HL, HH × RGB)"]
+        end
+
+        conv_in_enc["Conv2d<br/>12 → 128"]
+
+        subgraph DownBlock1["WFDownBlock 1 (128→256)"]
+            res_d1["ResnetBlock2D × 2"]
+            down1["Downsample 2×"]
+            ef_ext1["Energy Flow Extract<br/>HaarWT2D → Conv(12→128)"]
+            merge1["Concat + ResnetBlock"]
+        end
+
+        subgraph DownBlock2["WFDownBlock 2 (256→512)"]
+            res_d2["ResnetBlock2D × 2"]
+            down2["Downsample 2×"]
+            ef_ext2["Energy Flow Extract<br/>HaarWT2D → Conv(12→128)"]
+            merge2["Concat + ResnetBlock"]
+        end
+
+        subgraph MidEnc["Mid Layers"]
+            mid_res1_enc["ResnetBlock2D"]
+            mid_attn_enc[/"Attention2DFix<br/>Self-Attention"/]
+            mid_res2_enc["ResnetBlock2D"]
+        end
+
+        norm_enc("GroupNorm")
+        act_enc{"SiLU"}
+        conv_out_enc["Conv2d<br/>512 → 16"]
+    end
+
+    subgraph Latent["Latent Space"]
+        gaussian["DiagonalGaussianDistribution<br/>Split → μ, log(σ²)"]
+        sample(("Sample z<br/>μ + σε"))
+        latent_z(["Latent z<br/>(B, 8, H/8, W/8)"])
+    end
+
+    subgraph Decoder["Decoder"]
+        conv_in_dec["Conv2d<br/>8 → 512"]
+
+        subgraph MidDec["Mid Layers"]
+            mid_res1_dec["ResnetBlock2D"]
+            mid_attn_dec[/"Attention2DFix<br/>Self-Attention"/]
+            mid_res2_dec["ResnetBlock2D"]
+        end
+
+        subgraph UpBlock1["WFUpBlock 1 (512→256)"]
+            res_u1["ResnetBlock2D × 3"]
+            up1["Upsample 2×"]
+            ef_inj1["Energy Flow Inject<br/>Conv(128→12) → InvHaarWT2D"]
+        end
+
+        subgraph UpBlock2["WFUpBlock 2 (256→128)"]
+            res_u2["ResnetBlock2D × 3"]
+            up2["Upsample 2×"]
+            ef_inj2["Energy Flow Inject<br/>Conv(128→12) → InvHaarWT2D"]
+        end
+
+        norm_dec("GroupNorm")
+        act_dec{"SiLU"}
+        conv_out_dec["Conv2d<br/>128 → 12"]
+
+        subgraph WaveletRecon["Wavelet Reconstruction"]
+            haar2d_dec["InverseHaarWaveletTransform2D<br/>12 → 3 channels"]
+        end
+    end
+
+    subgraph Output["Output"]
+        output(["Reconstructed Image<br/>(B, 3, H, W)"])
+    end
+
+    %% Main Flow
+    input --> haar2d_enc
+    haar2d_enc --> conv_in_enc
+    conv_in_enc --> res_d1
+    res_d1 --> down1
+    down1 --> ef_ext1
+    ef_ext1 --> merge1
+    merge1 --> res_d2
+    res_d2 --> down2
+    down2 --> ef_ext2
+    ef_ext2 --> merge2
+    merge2 --> mid_res1_enc
+    mid_res1_enc --> mid_attn_enc
+    mid_attn_enc --> mid_res2_enc
+    mid_res2_enc --> norm_enc
+    norm_enc --> act_enc
+    act_enc --> conv_out_enc
+    conv_out_enc --> gaussian
+    gaussian --> sample
+    sample --> latent_z
+
+    latent_z --> conv_in_dec
+    conv_in_dec --> mid_res1_dec
+    mid_res1_dec --> mid_attn_dec
+    mid_attn_dec --> mid_res2_dec
+    mid_res2_dec --> res_u1
+    res_u1 --> up1
+    up1 --> ef_inj1
+    ef_inj1 --> res_u2
+    res_u2 --> up2
+    up2 --> ef_inj2
+    ef_inj2 --> norm_dec
+    norm_dec --> act_dec
+    act_dec --> conv_out_dec
+    conv_out_dec --> haar2d_dec
+    haar2d_dec --> output
+
+    %% Energy Flow Skip Connections (dashed)
+    ef_ext1 -.->|"wavelet coeffs"| ef_inj2
+    ef_ext2 -.->|"wavelet coeffs"| ef_inj1
+
+    %% Styling
+    style input fill:#e8f5e9
+    style output fill:#e8f5e9
+    style latent_z fill:#fff3e0
+    style sample fill:#ffd700
+    style gaussian fill:#fff9c4
+    style haar2d_enc fill:#bbdefb
+    style haar2d_dec fill:#bbdefb
+    style mid_attn_enc fill:#f8bbd9
+    style mid_attn_dec fill:#f8bbd9
+    style ef_ext1 fill:#e1bee7
+    style ef_ext2 fill:#e1bee7
+    style ef_inj1 fill:#e1bee7
+    style ef_inj2 fill:#e1bee7

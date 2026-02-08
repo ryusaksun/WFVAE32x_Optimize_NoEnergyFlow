@@ -1,0 +1,175 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e1f5fe', 'lineColor': '#333'}}}%%
+flowchart TD
+    subgraph Input["Input"]
+        input(["Video<br/>(B, 3, T, H, W)"])
+    end
+
+    subgraph Encoder["Encoder - Hierarchical Wavelet Energy Flow"]
+        subgraph WaveletDecomp3D["3D Wavelet Decomposition"]
+            haar3d_enc["HaarWaveletTransform3D<br/>3 → 24 coeffs<br/>(8 freq bands × RGB)"]
+        end
+
+        subgraph L1EnergyFlow["L1 Energy Flow (Spatial)"]
+            l1_extract["Extract RGB Low-Freq<br/>(L,L,L) component"]
+            l1_haar2d["HaarWaveletTransform2D<br/>→ 12 coeffs"]
+            l1_conv["Conv2d(12 → 64)"]
+        end
+
+        subgraph L2EnergyFlow["L2 Energy Flow (Spatiotemporal)"]
+            l2_extract["Further Decompose L1<br/>RGB Low-Freq"]
+            l2_haar3d["HaarWaveletTransform3D<br/>→ 24 coeffs"]
+            l2_conv["Conv2d(24 → 64)"]
+        end
+
+        subgraph Down1["Down Block 1"]
+            down1_conv["Conv2d(24 → 192)"]
+            down1_res["ResnetBlock2D × 2"]
+            down1_ds["Downsample 2×<br/>(Spatial only)"]
+        end
+
+        concat1(("+ L1<br/>Energy"))
+
+        subgraph Down2["Down Block 2"]
+            down2_res["ResnetBlock3D × 2"]
+            down2_ds["Spatial2xTime2x3DDownsample<br/>(2× spatial, 2× temporal)"]
+        end
+
+        concat2(("+ L2<br/>Energy"))
+
+        subgraph MidEnc["Mid Layers"]
+            mid_res_enc["ResnetBlock3D × 2"]
+            mid_attn_enc[/"AttnBlock3DFix<br/>3D Self-Attention"/]
+        end
+
+        conv_out_enc["CausalConv3d<br/>512 → 32"]
+    end
+
+    subgraph Latent["Latent Space"]
+        gaussian["DiagonalGaussianDistribution<br/>Split → μ, log(σ²)"]
+        sample(("Sample z<br/>μ + σε"))
+        latent_z(["Latent z<br/>(B, 16, T/4, H/8, W/8)"])
+    end
+
+    subgraph Decoder["Decoder - Hierarchical Wavelet Reconstruction"]
+        conv_in_dec["CausalConv3d<br/>16 → 512"]
+
+        subgraph MidDec["Mid Layers"]
+            mid_res_dec["ResnetBlock3D × 2"]
+            mid_attn_dec[/"AttnBlock3DFix<br/>3D Self-Attention"/]
+        end
+
+        subgraph L2Recon["L2 Energy Flow Reconstruction"]
+            l2_ef_extract["Extract Energy Flow<br/>from features"]
+            l2_conv_dec["Conv(128 → 24)"]
+            l2_inv_haar3d["InverseHaarWaveletTransform3D<br/>→ RGB reconstruction"]
+        end
+
+        subgraph Up2["Up Block 2"]
+            up2_res["ResnetBlock3D × 2"]
+            up2_us["Spatial2xTime2x3DUpsample<br/>(2× spatial, 2× temporal)"]
+        end
+
+        subgraph L1Recon["L1 Energy Flow Reconstruction"]
+            l1_ef_extract["Extract Energy Flow<br/>from features"]
+            l1_conv_dec["Conv(128 → 12)"]
+            l1_inv_haar2d["InverseHaarWaveletTransform2D"]
+            l1_add_skip(("+ L2<br/>Skip"))
+        end
+
+        subgraph Up1["Up Block 1"]
+            up1_res["ResnetBlock3D × 2"]
+            up1_us["Upsample 2×<br/>(Spatial only)"]
+        end
+
+        subgraph FinalBlock["Final Block"]
+            final_res["ResnetBlock3D × 2"]
+            norm_dec("GroupNorm")
+            act_dec{"SiLU"}
+            conv_out_dec["Conv2d(192 → 24)"]
+        end
+
+        final_add_skip(("+ L1<br/>Skip"))
+
+        subgraph WaveletRecon3D["3D Wavelet Reconstruction"]
+            haar3d_dec["InverseHaarWaveletTransform3D<br/>24 → 3 channels"]
+        end
+    end
+
+    subgraph Output["Output"]
+        output(["Reconstructed Video<br/>(B, 3, T, H, W)"])
+    end
+
+    %% Encoder Flow
+    input --> haar3d_enc
+    haar3d_enc --> l1_extract
+    l1_extract --> l1_haar2d
+    l1_haar2d --> l1_conv
+    l1_extract --> l2_extract
+    l2_extract --> l2_haar3d
+    l2_haar3d --> l2_conv
+
+    haar3d_enc --> down1_conv
+    down1_conv --> down1_res
+    down1_res --> down1_ds
+    down1_ds --> concat1
+    l1_conv --> concat1
+    concat1 --> down2_res
+    down2_res --> down2_ds
+    down2_ds --> concat2
+    l2_conv --> concat2
+    concat2 --> mid_res_enc
+    mid_res_enc --> mid_attn_enc
+    mid_attn_enc --> conv_out_enc
+    conv_out_enc --> gaussian
+    gaussian --> sample
+    sample --> latent_z
+
+    %% Decoder Flow
+    latent_z --> conv_in_dec
+    conv_in_dec --> mid_res_dec
+    mid_res_dec --> mid_attn_dec
+    mid_attn_dec --> l2_ef_extract
+    l2_ef_extract --> l2_conv_dec
+    l2_conv_dec --> l2_inv_haar3d
+
+    mid_attn_dec --> up2_res
+    up2_res --> up2_us
+    up2_us --> l1_ef_extract
+    l1_ef_extract --> l1_conv_dec
+    l1_conv_dec --> l1_inv_haar2d
+    l2_inv_haar3d --> l1_add_skip
+    l1_inv_haar2d --> l1_add_skip
+
+    up2_us --> up1_res
+    up1_res --> up1_us
+    up1_us --> final_res
+    final_res --> norm_dec
+    norm_dec --> act_dec
+    act_dec --> conv_out_dec
+    l1_add_skip --> final_add_skip
+    conv_out_dec --> final_add_skip
+    final_add_skip --> haar3d_dec
+    haar3d_dec --> output
+
+    %% Styling
+    style input fill:#e8f5e9
+    style output fill:#e8f5e9
+    style latent_z fill:#fff3e0
+    style sample fill:#ffd700
+    style gaussian fill:#fff9c4
+    style haar3d_enc fill:#bbdefb
+    style haar3d_dec fill:#bbdefb
+    style l1_haar2d fill:#bbdefb
+    style l2_haar3d fill:#bbdefb
+    style l1_inv_haar2d fill:#bbdefb
+    style l2_inv_haar3d fill:#bbdefb
+    style mid_attn_enc fill:#f8bbd9
+    style mid_attn_dec fill:#f8bbd9
+    style concat1 fill:#e1bee7
+    style concat2 fill:#e1bee7
+    style l1_add_skip fill:#e1bee7
+    style final_add_skip fill:#e1bee7
+    style l1_conv fill:#ce93d8
+    style l2_conv fill:#ce93d8
+    style l1_conv_dec fill:#ce93d8
+    style l2_conv_dec fill:#ce93d8

@@ -1,0 +1,1 @@
+from .perceptual_loss_2d import LPIPSWithDiscriminator

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd design doc for training loss logging and visualization\n\nFeatures:\n- CSV logging of training and validation losses\n- Automatic plot generation with multi-subplot layout\n- Discriminator start marker at 20000 steps\n- Configurable logging frequency\n\nIncludes error handling, usage examples, and dependencies.\nEOF\n\\)\")",
+      "Bash(git commit:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git worktree:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git --version)",
+      "Bash(python3:*)",
+      "Bash(/bin/ls:*)",
+      "Bash(bash:*)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(test:*)"
+    ]
+  }
+}

@@ -1,0 +1,195 @@
+%%{init: {'theme': 'base'}}%%
+classDiagram
+    direction TB
+
+    class VideoBaseAE {
+        <<abstract>>
+        +latent_dim: int
+        +encode(x) AutoencoderKLOutput
+        +decode(z) DecoderOutput
+        +forward(x) ForwardOutput
+        +from_pretrained(path)
+        +from_config(config_path)
+    }
+
+    class WFIVAE2Model {
+        +encoder: WFIVAE2Encoder
+        +decoder: WFIVAE2Decoder
+        +latent_dim: int = 8
+        +base_channels: [128, 256, 512]
+        +encode(x) AutoencoderKLOutput
+        +decode(z) DecoderOutput
+        +forward(x, sample_posterior) ForwardOutput
+    }
+
+    class WFVAEModel {
+        +encoder: WFVAEEncoder
+        +decoder: WFVAEDecoder
+        +latent_dim: int = 16
+        +base_channels: int = 192
+        +l1_wavelet: HaarWaveletTransform2D
+        +l2_wavelet: HaarWaveletTransform3D
+        +tile_encode(x, tile_size)
+        +tile_decode(z, tile_size)
+    }
+
+    class WFIVAE2Encoder {
+        +haar_wavelet: HaarWaveletTransform2D
+        +conv_in: Conv2d
+        +down_blocks: ModuleList~WFDownBlock~
+        +mid_layers: ModuleList
+        +norm_out: GroupNorm
+        +conv_out: Conv2d
+        +forward(x) tuple
+    }
+
+    class WFIVAE2Decoder {
+        +conv_in: Conv2d
+        +mid_layers: ModuleList
+        +up_blocks: ModuleList~WFUpBlock~
+        +norm_out: GroupNorm
+        +conv_out: Conv2d
+        +inv_haar_wavelet: InverseHaarWaveletTransform2D
+        +forward(z) DecoderOutput
+    }
+
+    class WFDownBlock {
+        +in_channels: int
+        +out_channels: int
+        +energy_flow_size: int
+        +res_blocks: ModuleList~ResnetBlock2D~
+        +downsample: Downsample
+        +haar_wavelet: HaarWaveletTransform2D
+        +energy_flow_conv: Conv2d
+        +forward(x) tuple[Tensor, Tensor]
+    }
+
+    class WFUpBlock {
+        +in_channels: int
+        +out_channels: int
+        +energy_flow_size: int
+        +res_blocks: ModuleList~ResnetBlock2D~
+        +upsample: Upsample
+        +inv_haar_wavelet: InverseHaarWaveletTransform2D
+        +energy_flow_conv: Conv2d
+        +forward(x, wavelet_skip) tuple
+    }
+
+    class HaarWaveletTransform2D {
+        +filters: Tensor [4, 1, 2, 2]
+        +forward(x) Tensor
+        -_create_haar_filters() Tensor
+    }
+
+    class InverseHaarWaveletTransform2D {
+        +filters: Tensor [4, 1, 2, 2]
+        +forward(x) Tensor
+    }
+
+    class HaarWaveletTransform3D {
+        +filters: Tensor [8, 1, 2, 2, 2]
+        +forward(x) Tensor
+    }
+
+    class InverseHaarWaveletTransform3D {
+        +filters: Tensor [8, 1, 2, 2, 2]
+        +is_first_chunk: bool
+        +forward(x) Tensor
+    }
+
+    class ResnetBlock2D {
+        +in_channels: int
+        +out_channels: int
+        +norm1: GroupNorm
+        +conv1: Conv2d
+        +norm2: GroupNorm
+        +conv2: Conv2d
+        +nin_shortcut: Conv2d?
+        +forward(x) Tensor
+    }
+
+    class ResnetBlock3D {
+        +in_channels: int
+        +out_channels: int
+        +norm1: GroupNorm
+        +conv1: CausalConv3d
+        +norm2: GroupNorm
+        +conv2: CausalConv3d
+        +forward(x) Tensor
+    }
+
+    class CausalConv3d {
+        +in_channels: int
+        +out_channels: int
+        +kernel_size: tuple
+        +stride: tuple
+        +causal_cached: deque
+        +enable_cached: bool
+        +forward(x) Tensor
+    }
+
+    class Attention2DFix {
+        +channels: int
+        +num_heads: int
+        +norm: GroupNorm
+        +qkv: Conv2d
+        +proj_out: Conv2d
+        +forward(x) Tensor
+    }
+
+    class AttnBlock3DFix {
+        +channels: int
+        +norm: GroupNorm
+        +q/k/v: Conv2d
+        +proj_out: Conv2d
+        +forward(x) Tensor
+    }
+
+    class DiagonalGaussianDistribution {
+        +mean: Tensor
+        +logvar: Tensor
+        +std: Tensor
+        +sample() Tensor
+        +mode() Tensor
+        +kl() Tensor
+    }
+
+    class ModelRegistry {
+        <<singleton>>
+        +_registry: Dict
+        +register(name) decorator
+        +get_model(name) Type
+    }
+
+    %% Inheritance
+    VideoBaseAE <|-- WFIVAE2Model
+    VideoBaseAE <|-- WFVAEModel
+
+    %% Composition - Image VAE
+    WFIVAE2Model *-- WFIVAE2Encoder
+    WFIVAE2Model *-- WFIVAE2Decoder
+    WFIVAE2Encoder *-- HaarWaveletTransform2D
+    WFIVAE2Encoder *-- WFDownBlock
+    WFIVAE2Decoder *-- WFUpBlock
+    WFIVAE2Decoder *-- InverseHaarWaveletTransform2D
+
+    %% Composition - Video VAE
+    WFVAEModel *-- HaarWaveletTransform2D : L1
+    WFVAEModel *-- HaarWaveletTransform3D : L2
+    WFVAEModel *-- InverseHaarWaveletTransform2D : L1
+    WFVAEModel *-- InverseHaarWaveletTransform3D : L2
+    WFVAEModel *-- ResnetBlock3D
+    WFVAEModel *-- AttnBlock3DFix
+    WFVAEModel *-- CausalConv3d
+
+    %% Block composition
+    WFDownBlock *-- ResnetBlock2D
+    WFDownBlock *-- HaarWaveletTransform2D
+    WFUpBlock *-- ResnetBlock2D
+    WFUpBlock *-- InverseHaarWaveletTransform2D
+
+    %% Associations
+    WFIVAE2Model ..> DiagonalGaussianDistribution : creates
+    WFVAEModel ..> DiagonalGaussianDistribution : creates
+    ModelRegistry ..> WFIVAE2Model : registers
+    ModelRegistry ..> WFVAEModel : registers
