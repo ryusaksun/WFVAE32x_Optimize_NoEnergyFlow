@@ -74,7 +74,16 @@ export MKL_NUM_THREADS=1
 # ============================================
 # WandB 配置
 # ============================================
-export WANDB_PROJECT=WFIVAE
+export WANDB_PROJECT="${WANDB_PROJECT:-WFIVAE}"
+DISABLE_WANDB="${DISABLE_WANDB:-1}"  # 1/true/yes: 关闭 wandb；0/false/no: 开启
+DISABLE_WANDB="$(echo "$DISABLE_WANDB" | tr '[:upper:]' '[:lower:]')"
+if [ "$DISABLE_WANDB" = "1" ] || [ "$DISABLE_WANDB" = "true" ] || [ "$DISABLE_WANDB" = "yes" ]; then
+    WANDB_ARGS="--disable_wandb"
+    WANDB_STATUS="关闭"
+else
+    WANDB_ARGS=""
+    WANDB_STATUS="开启 (project: ${WANDB_PROJECT})"
+fi
 
 # ============================================
 # 路径配置
@@ -88,11 +97,14 @@ export WANDB_PROJECT=WFIVAE
 # - 使用 --disable_plot 禁用自动绘图
 #
 
-# 原始数据清单文件（JSONL格式，每行包含 {"image_path": "/path/to/image.jpg"}）
-ORIGINAL_MANIFEST="${ORIGINAL_MANIFEST:-/mnt/goosefs-lite-mnt/image_manifest.jsonl}"
+# 原始数据清单文件（JSONL格式，支持 image_path/path/target 字段）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_NAME="$(basename "$SCRIPT_DIR")"
+DEFAULT_MANIFEST="${SCRIPT_DIR}/ssk_image_manifest.jsonl"
+ORIGINAL_MANIFEST="${ORIGINAL_MANIFEST:-$DEFAULT_MANIFEST}"
 
-# 输出目录 (包含 disc_start 标识以区分不同实验)
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdc/wfvae_8x_disc5}"
+# 输出目录 (默认放在 /mnt/sdc 下，包含项目名以区分实验)
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdc/${PROJECT_NAME}}"
 
 # 临时划分文件路径 (放在输出目录下)
 TRAIN_MANIFEST="${OUTPUT_DIR}/train_manifest.jsonl"
@@ -102,11 +114,11 @@ EVAL_MANIFEST="${OUTPUT_DIR}/eval_manifest.jsonl"
 RESOLUTION="${RESOLUTION:-1024}"
 
 # 训练/验证步频与日志配置（可通过环境变量覆盖）
-MAX_STEPS="${MAX_STEPS:-100000}"
+MAX_STEPS="${MAX_STEPS:-1000000}"
 SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-2000}"
 EVAL_STEPS="${EVAL_STEPS:-1000}"
-EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-0}"      # 0 表示使用完整验证集
-EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-8}"  # 仅控制保存可视化图像数量，不影响 patch 分数覆盖范围
+EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-30}"     # 验证子集大小，0 表示使用完整验证集
+EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-20}"  # 验证重建图与 patch 可视化样本数量（默认保持一致）
 CSV_LOG_STEPS="${CSV_LOG_STEPS:-50}"
 LOG_STEPS="${LOG_STEPS:-10}"
 DATASET_NUM_WORKER="${DATASET_NUM_WORKER:-8}"
@@ -236,6 +248,7 @@ echo "GPU: $GPU ($NUM_GPUS 卡)"
 echo "最大训练步数: $MAX_STEPS"
 echo "Checkpoint间隔: $SAVE_CKPT_STEP"
 echo "验证间隔: $EVAL_STEPS"
+echo "WandB: $WANDB_STATUS"
 if [ "$EVAL_SUBSET_SIZE" = "0" ]; then
     echo "验证样本数: 全量"
 else
@@ -344,6 +357,7 @@ TRAIN_ARGS="train_image_ddp.py \
     --csv_log_steps $CSV_LOG_STEPS \
     --log_steps $LOG_STEPS \
     --dataset_num_worker $DATASET_NUM_WORKER \
+    $WANDB_ARGS \
     --find_unused_parameters \
     $RESUME_ARGS"
 

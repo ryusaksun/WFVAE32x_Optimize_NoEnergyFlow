@@ -28,7 +28,10 @@ echo "✓ Training manifest: /mnt/sda/datasets/imagevae_1024/train_manifest.json
 echo "✓ Validation manifest: /mnt/sda/datasets/imagevae_1024/eval_manifest.jsonl"
 
 # Create output directory
-OUTPUT_DIR="/mnt/sdc/yyy_WFVAE_原版"
+# 默认输出目录以当前项目目录名命名，避免沿用旧项目名
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_NAME="$(basename "$SCRIPT_DIR")"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdc/${PROJECT_NAME}}"
 mkdir -p ${OUTPUT_DIR}
 echo "✓ Output directory: ${OUTPUT_DIR}"
 
@@ -54,7 +57,16 @@ echo "✓ Total batch size: ${TOTAL_BATCH_SIZE} (${BATCH_SIZE_PER_GPU} per GPU)"
 
 # Set environment variables
 unset https_proxy
-export WANDB_PROJECT=WFIVAE_1024
+export WANDB_PROJECT="${WANDB_PROJECT:-WFIVAE_1024}"
+DISABLE_WANDB="${DISABLE_WANDB:-1}"  # 1/true/yes: 关闭 wandb；0/false/no: 开启
+DISABLE_WANDB="$(echo "$DISABLE_WANDB" | tr '[:upper:]' '[:lower:]')"
+if [ "$DISABLE_WANDB" = "1" ] || [ "$DISABLE_WANDB" = "true" ] || [ "$DISABLE_WANDB" = "yes" ]; then
+    WANDB_ARGS="--disable_wandb"
+    echo "✓ WandB: disabled"
+else
+    WANDB_ARGS=""
+    echo "✓ WandB: enabled (project: ${WANDB_PROJECT})"
+fi
 export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((USER_GPUS-1)))
 export GLOO_SOCKET_IFNAME=bond0
 export NCCL_SOCKET_IFNAME=bond0
@@ -114,6 +126,7 @@ torchrun \
     --dataset_num_worker 4 \
     --wavelet_loss \
     --wavelet_weight 0.1 \
+    ${WANDB_ARGS} \
     --find_unused_parameters
 
 echo "=========================================="

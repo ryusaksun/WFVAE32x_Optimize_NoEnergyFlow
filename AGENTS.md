@@ -35,11 +35,9 @@
 - `training_curves_final.png`：训练结束最终图
 - `val_images/original/` 与 `val_images/reconstructed/`：验证图像
 - `val_patch_scores/step_xxxxxxxx/` 与 `val_patch_scores/step_xxxxxxxx_ema/`：
-  - `real_logits.npy`
-  - `recon_logits.npy`
-  - `real_sigmoid.npy`
-  - `recon_sigmoid.npy`
   - `summary.csv`
+  - `patch_vis/real/*.png`（原图 + patch 热力图 + 叠加图）
+  - `patch_vis/recon/*.png`（原图 + 重建打分热力图 + 叠加图）
 - `checkpoint-*.ckpt`：模型与优化器状态
 
 ## 5. 训练脚本推荐用法

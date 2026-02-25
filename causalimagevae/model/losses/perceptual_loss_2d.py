@@ -162,6 +162,7 @@ class LPIPSWithDiscriminator(nn.Module):
                 f"{split}/disc_factor": torch.tensor(disc_factor),
                 f"{split}/g_loss": g_loss.detach().mean(),
             }
+            log[f"{split}/p_loss"] = p_loss.detach().mean() if self.perceptual_weight > 0 else torch.tensor(0.0)
             if self.wavelet_weight > 0:
                 log[f"{split}/wl_loss"] = wl_loss.detach().mean()
             return loss, log

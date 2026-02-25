@@ -8,16 +8,21 @@ import argparse
 import logging
 import tqdm
 from itertools import chain
-import wandb
 import random
 import numpy as np
 from pathlib import Path
+from PIL import Image, ImageDraw
 from causalimagevae.model import *
 from causalimagevae.model.ema_model import EMA
 from causalimagevae.dataset.ddp_sampler import CustomDistributedSampler
 from causalimagevae.dataset.image_dataset import ImageDataset, ValidImageDataset
 from causalimagevae.model.utils.module_utils import resolve_str_to_obj
 from torchvision.utils import make_grid, save_image
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 try:
     import lpips
@@ -123,34 +128,237 @@ def _extract_patch_maps(logits):
         return logits
     raise ValueError(f"Unexpected PatchGAN logits shape: {tuple(logits.shape)}")
 
-def save_patch_scores(patch_records, output_dir):
+def _safe_file_stem(file_name, fallback):
+    stem = Path(file_name).stem if file_name else fallback
+    cleaned = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in stem).strip("._")
+    return cleaned or fallback
+
+def _resolve_sample_image_path(val_dataset, sample_idx):
+    base_dataset = val_dataset.dataset if isinstance(val_dataset, Subset) else val_dataset
+    if not hasattr(base_dataset, "samples"):
+        return None
+
+    samples = base_dataset.samples
+    if sample_idx < 0 or sample_idx >= len(samples):
+        return None
+
+    sample = samples[sample_idx]
+    if isinstance(sample, str):
+        return sample
+
+    if isinstance(sample, dict):
+        image_path = sample.get("image_path", sample.get("path", sample.get("target", "")))
+        if image_path and (not os.path.isabs(image_path)):
+            base_dir = getattr(base_dataset, "base_dir", "")
+            if base_dir:
+                image_path = os.path.join(base_dir, image_path)
+        return image_path or None
+
+    return None
+
+def _resize_and_center_crop(image, resolution):
+    bilinear = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    width, height = image.size
+    short_side = min(width, height)
+    if short_side <= 0:
+        raise ValueError("Invalid image size.")
+
+    scale = float(resolution) / float(short_side)
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    image = image.resize((new_width, new_height), resample=bilinear)
+
+    left = max(0, (new_width - resolution) // 2)
+    top = max(0, (new_height - resolution) // 2)
+    return image.crop((left, top, left + resolution, top + resolution))
+
+def _load_aligned_image(val_dataset, sample_idx, eval_resolution):
+    image_path = _resolve_sample_image_path(val_dataset, sample_idx)
+    if image_path is None:
+        return None
+
+    try:
+        image = Image.open(image_path).convert("RGB")
+        image = _resize_and_center_crop(image, eval_resolution)
+        return np.asarray(image, dtype=np.uint8)
+    except Exception:
+        return None
+
+def _tensor_image_to_uint8(image_tensor):
+    if not torch.is_tensor(image_tensor):
+        return None
+
+    image = image_tensor.detach().float().cpu().clamp(0, 1)
+    if image.dim() != 3:
+        return None
+    if image.shape[0] in (1, 3):
+        image = image.permute(1, 2, 0).contiguous()
+    if image.shape[-1] == 1:
+        image = image.repeat(1, 1, 3)
+    if image.shape[-1] != 3:
+        return None
+
+    return (image.numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+
+def _resize_patch_map(score_map, out_height, out_width):
+    h, w = score_map.shape
+    row_idx = (np.arange(out_height) * h / out_height).astype(int).clip(0, h - 1)
+    col_idx = (np.arange(out_width) * w / out_width).astype(int).clip(0, w - 1)
+    return score_map[row_idx[:, None], col_idx[None, :]]
+
+def _colorize_score_map(score_map):
+    score_map = np.clip(score_map, 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * score_map - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * score_map - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * score_map - 1.0), 0.0, 1.0)
+    return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+
+def _draw_patch_grid(image_rgb, grid_h, grid_w, color):
+    image = Image.fromarray(image_rgb)
+    draw = ImageDraw.Draw(image)
+    height, width = image_rgb.shape[:2]
+
+    for col in range(1, grid_w):
+        x = int(round(col * width / grid_w))
+        draw.line([(x, 0), (x, height)], fill=color, width=1)
+    for row in range(1, grid_h):
+        y = int(round(row * height / grid_h))
+        draw.line([(0, y), (width, y)], fill=color, width=1)
+    return np.asarray(image, dtype=np.uint8)
+
+def _make_colorbar(height, vmin, vmax, bar_width=30, total_width=90):
+    """生成垂直 colorbar，标注 vmin/vmax"""
+    canvas = np.full((height, total_width, 3), 255, dtype=np.uint8)
+    margin = 10
+    bar_height = height - 2 * margin
+
+    # 渐变色条 (top=vmax, bottom=vmin)
+    gradient = np.linspace(1.0, 0.0, bar_height).reshape(-1, 1)
+    gradient = np.repeat(gradient, bar_width, axis=1)
+    colored = _colorize_score_map(gradient)
+    canvas[margin:margin + bar_height, 5:5 + bar_width] = colored
+
+    # 用 PIL 写文字
+    img = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(img)
+    text_x = 5 + bar_width + 3
+    draw.text((text_x, margin - 2), f"{vmax:.3f}", fill=(0, 0, 0))
+    draw.text((text_x, margin + bar_height - 10), f"{vmin:.3f}", fill=(0, 0, 0))
+
+    return np.asarray(img, dtype=np.uint8)
+
+def _build_patch_score_panel(base_image, score_map):
+    score_map = np.asarray(score_map, dtype=np.float32)
+    grid_h, grid_w = score_map.shape
+    height, width = base_image.shape[:2]
+
+    # Per-image normalization
+    vmin, vmax = float(score_map.min()), float(score_map.max())
+    if vmax - vmin < 1e-6:
+        normalized = np.full_like(score_map, 0.5)
+    else:
+        normalized = (score_map - vmin) / (vmax - vmin)
+
+    upsampled = _resize_patch_map(normalized, height, width)
+    heatmap = _colorize_score_map(upsampled)
+    overlay = (
+        0.55 * base_image.astype(np.float32) + 0.45 * heatmap.astype(np.float32)
+    ).clip(0, 255).astype(np.uint8)
+
+    # 只在 cell 足够大时画网格
+    cell_size = min(width / grid_w, height / grid_h)
+    if cell_size >= 32:
+        original_grid = _draw_patch_grid(base_image.copy(), grid_h, grid_w, color=(180, 180, 180))
+        heatmap_grid = _draw_patch_grid(heatmap, grid_h, grid_w, color=(255, 255, 255))
+        overlay_grid = _draw_patch_grid(overlay, grid_h, grid_w, color=(255, 255, 255))
+    else:
+        original_grid = base_image.copy()
+        heatmap_grid = heatmap
+        overlay_grid = overlay
+
+    # 生成 colorbar
+    colorbar = _make_colorbar(height, vmin, vmax)
+
+    return np.concatenate([original_grid, heatmap_grid, overlay_grid, colorbar], axis=1)
+
+def _save_patch_score_visualizations(
+    ordered_records,
+    output_dir,
+    val_dataset,
+    eval_resolution,
+    vis_max_samples,
+    selected_sample_indices=None,
+    recon_image_by_sample_idx=None,
+):
+    if vis_max_samples is not None and vis_max_samples <= 0:
+        return
+    if len(ordered_records) == 0:
+        return
+
+    if eval_resolution is None or eval_resolution <= 0:
+        first_map = np.asarray(ordered_records[0]["real_sigmoid"], dtype=np.float32)
+        eval_resolution = int(max(first_map.shape))
+
+    real_dir = output_dir / "patch_vis" / "real"
+    recon_dir = output_dir / "patch_vis" / "recon"
+    real_dir.mkdir(exist_ok=True, parents=True)
+    recon_dir.mkdir(exist_ok=True, parents=True)
+
+    selected_records = ordered_records
+    if selected_sample_indices is not None:
+        sample_idx_to_record = {
+            int(record["sample_idx"]): record for record in ordered_records
+        }
+        selected_records = [
+            sample_idx_to_record[sample_idx]
+            for sample_idx in selected_sample_indices
+            if sample_idx in sample_idx_to_record
+        ]
+
+    max_samples = (
+        len(selected_records)
+        if vis_max_samples is None
+        else min(len(selected_records), int(vis_max_samples))
+    )
+    selected_records = selected_records[:max_samples]
+
+    for row_id, record in enumerate(selected_records):
+        sample_idx = int(record["sample_idx"])
+        file_name = record.get("file_name", "")
+        fallback_name = f"sample_{sample_idx:08d}"
+        stem = _safe_file_stem(file_name, fallback_name)
+        image_name = f"{row_id:05d}_{sample_idx:08d}_{stem}.png"
+
+        real_base_image = _load_aligned_image(val_dataset, sample_idx, eval_resolution) if val_dataset is not None else None
+        if real_base_image is None:
+            real_base_image = np.full((eval_resolution, eval_resolution, 3), 127, dtype=np.uint8)
+
+        recon_base_image = None
+        if recon_image_by_sample_idx is not None:
+            recon_base_image = recon_image_by_sample_idx.get(sample_idx)
+        if recon_base_image is None:
+            recon_base_image = real_base_image
+
+        real_panel = _build_patch_score_panel(real_base_image, record["real_sigmoid"])
+        recon_panel = _build_patch_score_panel(recon_base_image, record["recon_sigmoid"])
+
+        Image.fromarray(real_panel).save(real_dir / image_name)
+        Image.fromarray(recon_panel).save(recon_dir / image_name)
+
+def save_patch_scores(
+    patch_records,
+    output_dir,
+    val_dataset=None,
+    eval_resolution=256,
+    vis_max_samples=None,
+    selected_sample_indices=None,
+    recon_image_by_sample_idx=None,
+):
     if len(patch_records) == 0:
         return
 
     output_dir.mkdir(exist_ok=True, parents=True)
     ordered_records = sorted(patch_records, key=lambda x: int(x["sample_idx"]))
-
-    real_logits_array = np.stack(
-        [np.asarray(record["real_logits"], dtype=np.float32) for record in ordered_records],
-        axis=0,
-    )
-    recon_logits_array = np.stack(
-        [np.asarray(record["recon_logits"], dtype=np.float32) for record in ordered_records],
-        axis=0,
-    )
-    real_sigmoid_array = np.stack(
-        [np.asarray(record["real_sigmoid"], dtype=np.float32) for record in ordered_records],
-        axis=0,
-    )
-    recon_sigmoid_array = np.stack(
-        [np.asarray(record["recon_sigmoid"], dtype=np.float32) for record in ordered_records],
-        axis=0,
-    )
-
-    np.save(output_dir / "real_logits.npy", real_logits_array)
-    np.save(output_dir / "recon_logits.npy", recon_logits_array)
-    np.save(output_dir / "real_sigmoid.npy", real_sigmoid_array)
-    np.save(output_dir / "recon_sigmoid.npy", recon_sigmoid_array)
 
     summary_path = output_dir / "summary.csv"
     fieldnames = [
@@ -191,8 +399,18 @@ def save_patch_scores(patch_records, output_dir):
                 "recon_sigmoid_max": float(recon_sigmoid.max()),
             })
 
-def log_patch_scores_to_wandb(patch_records, step, prefix):
-    if len(patch_records) == 0:
+    _save_patch_score_visualizations(
+        ordered_records=ordered_records,
+        output_dir=output_dir,
+        val_dataset=val_dataset,
+        eval_resolution=int(eval_resolution) if eval_resolution is not None else None,
+        vis_max_samples=vis_max_samples,
+        selected_sample_indices=selected_sample_indices,
+        recon_image_by_sample_idx=recon_image_by_sample_idx,
+    )
+
+def log_patch_scores_to_wandb(patch_records, step, prefix, use_wandb=True):
+    if (not use_wandb) or wandb is None or len(patch_records) == 0:
         return
 
     ordered_records = sorted(patch_records, key=lambda x: int(x["sample_idx"]))
@@ -239,6 +457,7 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
     lpips_list = []
     orig_images = []
     recon_images = []
+    logged_sample_indices = []
     patch_records = []
     num_image_log = args.eval_num_image_log
 
@@ -291,6 +510,7 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
                     img_recon = ((image_recon[i] + 1.0) / 2.0).float().cpu().clamp(0, 1)
                     orig_images.append(img_orig)
                     recon_images.append(img_recon)
+                    logged_sample_indices.append(int(sample_indices[i]))
                     num_image_log -= 1
 
             # Calculate PSNR
@@ -315,7 +535,7 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
                 bar.update()
             # Release gpus memory
             torch.cuda.empty_cache()
-    return psnr_list, lpips_list, orig_images, recon_images, patch_records
+    return psnr_list, lpips_list, orig_images, recon_images, patch_records, logged_sample_indices
 
 def gather_valid_result(psnr_list, lpips_list, orig_images, recon_images, patch_records, rank, world_size):
     gathered_psnr_list = [None for _ in range(world_size)]
@@ -351,9 +571,33 @@ def gather_valid_result(psnr_list, lpips_list, orig_images, recon_images, patch_
         deduplicated_patch_records,
     )
 
+def _to_csv_scalar(value):
+    if value is None or value == "":
+        return ""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return ""
+        return float(value.detach().mean().item())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return ""
+
+def _coerce_numeric_series(series, pd):
+    numeric_series = pd.to_numeric(series, errors="coerce")
+    need_fallback = numeric_series.isna() & series.notna()
+    if need_fallback.any():
+        extracted = (
+            series[need_fallback]
+            .astype(str)
+            .str.extract(r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", expand=False)
+        )
+        numeric_series.loc[need_fallback] = pd.to_numeric(extracted, errors="coerce")
+    return numeric_series
+
 def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_window=50):
     """
-    Plots training curves from CSV log file with 3x3 multi-subplot layout.
+    Plots training curves from CSV log file with dynamic multi-subplot layout.
 
     Args:
         csv_path: Path to the CSV file containing training logs
@@ -392,10 +636,13 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         ('generator_loss', 'Generator Loss', 'tab:blue'),
         ('discriminator_loss', 'Discriminator Loss', 'tab:orange'),
         ('rec_loss', 'Reconstruction Loss', 'tab:green'),
+        ('perceptual_loss', 'Perceptual Loss', 'tab:brown'),
         ('kl_loss', 'KL Loss', 'tab:red'),
         ('wavelet_loss', 'Wavelet Loss', 'tab:purple'),
         ('psnr', 'Validation PSNR', 'tab:cyan'),
         ('lpips', 'Validation LPIPS', 'tab:olive'),
+        ('psnr_ema', 'Validation PSNR (EMA)', 'tab:pink'),
+        ('lpips_ema', 'Validation LPIPS (EMA)', 'tab:gray'),
     ]
 
     # Create figure with dynamic subplot layout
@@ -413,44 +660,47 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         # Check if metric exists in dataframe
         if metric_key not in df.columns:
             ax.text(0.5, 0.5, f'{title}\n(No data)',
-                   ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(title)
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_title(title, fontsize=12)
             continue
 
-        # Get data and remove NaN values
-        data = df[['step', metric_key]].dropna()
+        # Get data and coerce possible legacy string values like "tensor(...)"
+        data = df[['step', metric_key]].copy()
+        data['step'] = pd.to_numeric(data['step'], errors='coerce')
+        data[metric_key] = _coerce_numeric_series(data[metric_key], pd)
+        data = data.dropna()
 
         if len(data) == 0:
             ax.text(0.5, 0.5, f'{title}\n(No data)',
-                   ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(title)
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_title(title, fontsize=12)
             continue
 
         steps = data['step'].values
         values = data[metric_key].values
 
         # Plot raw data with transparency
-        ax.plot(steps, values, alpha=0.3, color=color, linewidth=0.5, label='Raw')
+        ax.plot(steps, values, alpha=0.25, color=color, linewidth=0.5, label='Raw')
 
         # Apply smoothing if we have enough data points
         if len(values) > smoothing_window:
             try:
                 smoothed = uniform_filter1d(values, size=smoothing_window, mode='nearest')
                 ax.plot(steps, smoothed, color=color, linewidth=2, label=f'Smoothed (w={smoothing_window})')
-                ax.legend(loc='best', fontsize=8)
             except Exception as e:
                 print(f"Warning: Could not smooth {metric_key}: {e}")
+
+        ax.legend(loc='best', fontsize=8, framealpha=0.8)
 
         # Draw discriminator start line if applicable
         if disc_start is not None and disc_start > 0:
             ax.axvline(x=disc_start, color='red', linestyle='--',
-                      linewidth=1, alpha=0.5, label=f'Disc Start ({disc_start})')
+                      linewidth=1, alpha=0.5)
 
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel('Step', fontsize=9)
-        ax.set_ylabel('Value', fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=8)
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel('Step', fontsize=10)
+        ax.set_ylabel('Value', fontsize=10)
+        ax.tick_params(labelsize=9)
 
     # Hide unused axes when metric count is not a multiple of columns
     for idx in range(len(metrics), len(axes_flat)):
@@ -507,18 +757,27 @@ def train(args):
             logger.warning(f"Model will be inited randomly.")
         model = model_cls.from_config(args.model_config)
 
-    if global_rank == 0:
-        logger.warning("Connecting to WANDB...")
-        model_config = dict(**model.config)
-        args_config = dict(**vars(args))
-        if 'resolution' in model_config:
-            del model_config['resolution']
+    use_wandb = not args.disable_wandb
+    if use_wandb and wandb is None:
+        if global_rank == 0:
+            logger.warning("`wandb` 未安装，自动关闭 wandb 日志。")
+        use_wandb = False
 
-        wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "causalimagevae"),
-            config=dict(**model_config, **args_config),
-            name=get_exp_name(args),
-        )
+    if global_rank == 0:
+        if use_wandb:
+            logger.warning("Connecting to WANDB...")
+            model_config = dict(**model.config)
+            args_config = dict(**vars(args))
+            if 'resolution' in model_config:
+                del model_config['resolution']
+
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "causalimagevae"),
+                config=dict(**model_config, **args_config),
+                name=get_exp_name(args),
+            )
+        else:
+            logger.warning("WANDB 已禁用，仅写入本地日志与产物文件。")
 
     dist.barrier()
 
@@ -663,23 +922,52 @@ def train(args):
     # Initialize CSV logger
     csv_file = None
     csv_writer = None
+    csv_supports_ema_columns = False
+    csv_warned_ema_legacy = False
     if global_rank == 0:
         csv_path = ckpt_dir / "training_losses.csv"
         fieldnames = [
             "step", "generator_loss", "discriminator_loss",
-            "rec_loss", "kl_loss", "wavelet_loss", "psnr", "lpips"
+            "rec_loss", "perceptual_loss", "kl_loss", "wavelet_loss",
+            "psnr", "lpips", "psnr_ema", "lpips_ema",
         ]
 
         # Check if resuming from checkpoint
-        if args.resume_from_checkpoint and csv_path.exists():
+        resume_csv = (
+            args.resume_from_checkpoint
+            and csv_path.exists()
+            and csv_path.stat().st_size > 0
+        )
+        if resume_csv:
             logger.info(f"Resuming CSV logging to {csv_path}")
+            try:
+                with open(csv_path, "r", newline="") as existing_csv_file:
+                    existing_header = next(csv.reader(existing_csv_file), None)
+                if existing_header:
+                    fieldnames = existing_header
+            except Exception as e:
+                logger.warning(f"Failed to read CSV header from `{csv_path}`: {e}")
+
+            csv_supports_ema_columns = all(
+                col in fieldnames for col in ("psnr_ema", "lpips_ema")
+            )
+            if not csv_supports_ema_columns:
+                logger.warning(
+                    "Resumed CSV does not contain `psnr_ema/lpips_ema` columns; "
+                    "EMA validation metrics will be skipped in CSV to avoid mixing."
+                )
             csv_file = open(csv_path, "a", newline="")
-            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer = csv.DictWriter(
+                csv_file, fieldnames=fieldnames, extrasaction="ignore"
+            )
         else:
             logger.info(f"Starting new CSV log at {csv_path}")
             csv_file = open(csv_path, "w", newline="")
-            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer = csv.DictWriter(
+                csv_file, fieldnames=fieldnames, extrasaction="ignore"
+            )
             csv_writer.writeheader()
+            csv_supports_ema_columns = True
 
     # Setup signal handlers for graceful interruption
     def signal_handler(signum, frame):
@@ -754,6 +1042,8 @@ def train(args):
 
     num_epochs = args.epochs
     stop_training = False
+    last_gen_csv_logged_step = -args.csv_log_steps
+    last_disc_csv_logged_step = -args.csv_log_steps
 
     def update_bar(bar):
         if global_rank == 0:
@@ -821,7 +1111,7 @@ def train(args):
                     ema.update()
 
                 # log to wandb
-                if global_rank == 0 and current_step % args.log_steps == 0:
+                if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
                     wandb.log(
                         {"train/generator_loss": g_loss.item()}, step=current_step
                     )
@@ -832,22 +1122,29 @@ def train(args):
                         {"train/latents_std": posterior.sample().std().item()}, step=current_step
                     )
 
-                # Log to CSV
-                if current_step % args.csv_log_steps == 0 and csv_writer is not None:
+                # Log generator-related metrics to CSV
+                if (
+                    csv_writer is not None
+                    and (current_step - last_gen_csv_logged_step) >= args.csv_log_steps
+                ):
                     try:
                         csv_writer.writerow({
-                            "step": current_step,
-                            "generator_loss": g_loss.item(),
+                            "step": current_step + 1,
+                            "generator_loss": _to_csv_scalar(g_loss),
                             "discriminator_loss": "",
-                            "rec_loss": g_log.get('train/rec_loss', ""),
-                            "kl_loss": g_log.get('train/kl_loss', ""),
-                            "wavelet_loss": g_log.get('train/wl_loss', ""),
+                            "rec_loss": _to_csv_scalar(g_log.get('train/rec_loss')),
+                            "perceptual_loss": _to_csv_scalar(g_log.get('train/p_loss')),
+                            "kl_loss": _to_csv_scalar(g_log.get('train/kl_loss')),
+                            "wavelet_loss": _to_csv_scalar(g_log.get('train/wl_loss')),
                             "psnr": "",
-                            "lpips": ""
+                            "lpips": "",
+                            "psnr_ema": "",
+                            "lpips_ema": "",
                         })
                         csv_file.flush()
+                        last_gen_csv_logged_step = current_step
                     except Exception as e:
-                        logger.error(f"Failed to write CSV: {e}")
+                        logger.error(f"Failed to write generator metrics to CSV: {e}")
 
             # discriminator loss
             if step_dis:
@@ -866,39 +1163,54 @@ def train(args):
                 scaler.unscale_(disc_optimizer)
                 scaler.step(disc_optimizer)
                 scaler.update()
-                if global_rank == 0 and current_step % args.log_steps == 0:
+                if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
                     wandb.log(
                         {"train/discriminator_loss": d_loss.item()}, step=current_step
                     )
 
-                    # Log to CSV
-                    if current_step % args.csv_log_steps == 0 and csv_writer is not None:
-                        try:
-                            csv_writer.writerow({
-                                "step": current_step,
-                                "generator_loss": "",
-                                "discriminator_loss": d_loss.item(),
-                                "rec_loss": "",
-                                "kl_loss": "",
-                                "wavelet_loss": "",
-                                "psnr": "",
-                                "lpips": ""
-                            })
-                            csv_file.flush()
-                        except Exception as e:
-                            logger.error(f"Failed to write CSV: {e}")
+                # Log discriminator-related metrics to CSV
+                if (
+                    csv_writer is not None
+                    and (current_step - last_disc_csv_logged_step) >= args.csv_log_steps
+                ):
+                    try:
+                        csv_writer.writerow({
+                            "step": current_step + 1,
+                            "generator_loss": "",
+                            "discriminator_loss": _to_csv_scalar(d_log.get('train/disc_loss', d_loss)),
+                            "rec_loss": "",
+                            "perceptual_loss": "",
+                            "kl_loss": "",
+                            "wavelet_loss": "",
+                            "psnr": "",
+                            "lpips": "",
+                            "psnr_ema": "",
+                            "lpips_ema": "",
+                        })
+                        csv_file.flush()
+                        last_disc_csv_logged_step = current_step
+                    except Exception as e:
+                        logger.error(f"Failed to write discriminator metrics to CSV: {e}")
 
             update_bar(bar)
             current_step += 1
 
             # valid model
             def valid_model(model, name=""):
+                nonlocal csv_warned_ema_legacy
                 set_eval(modules_to_train)
                 discriminator = disc.module.discriminator
                 was_disc_training = discriminator.training
                 discriminator.eval()
                 try:
-                    psnr_list, lpips_list, orig_images, recon_images, patch_records = valid(
+                    (
+                        psnr_list,
+                        lpips_list,
+                        orig_images,
+                        recon_images,
+                        patch_records,
+                        logged_sample_indices,
+                    ) = valid(
                         global_rank, rank, model, discriminator, val_dataloader, precision, args
                     )
                     valid_psnr, valid_lpips, valid_orig_images, valid_recon_images, valid_patch_records = gather_valid_result(
@@ -909,11 +1221,12 @@ def train(args):
                     discriminator.train(was_disc_training)
 
                 if global_rank == 0:
+                    is_ema = name == "ema"
                     name = "_" + name if name != "" else name
+                    shared_sample_indices = [int(i) for i in logged_sample_indices[:args.eval_num_image_log]]
 
                     patch_score_dir = ckpt_dir / "val_patch_scores" / f"step_{current_step:08d}{name}"
-                    save_patch_scores(valid_patch_records, patch_score_dir)
-                    log_patch_scores_to_wandb(valid_patch_records, current_step, f"val{name}")
+                    recon_image_by_sample_idx = {}
 
                     # Create separate directories for original and reconstructed images
                     if len(valid_orig_images) > 0:
@@ -924,41 +1237,94 @@ def train(args):
                         recon_dir.mkdir(exist_ok=True, parents=True)
 
                         # Save individual images
-                        for idx, (orig_img, recon_img) in enumerate(zip(valid_orig_images, valid_recon_images)):
-                            save_image(orig_img, orig_dir / f"step_{current_step}_original{name}_{idx}.png")
-                            save_image(recon_img, recon_dir / f"step_{current_step}_recon{name}_{idx}.png")
-
-                        # Create grids for wandb logging
-                        orig_grid = make_grid(valid_orig_images, nrow=4)
-                        recon_grid = make_grid(valid_recon_images, nrow=4)
-                        wandb.log(
-                            {
-                                f"val{name}/original": wandb.Image(orig_grid),
-                                f"val{name}/reconstructed": wandb.Image(recon_grid),
-                            },
-                            step=current_step,
+                        max_shared = min(
+                            args.eval_num_image_log,
+                            len(valid_orig_images),
+                            len(valid_recon_images),
+                            len(shared_sample_indices),
                         )
-                    wandb.log({f"val{name}/psnr": valid_psnr}, step=current_step)
-                    wandb.log({f"val{name}/lpips": valid_lpips}, step=current_step)
+                        for idx in range(max_shared):
+                            sample_idx = shared_sample_indices[idx]
+                            orig_img = valid_orig_images[idx]
+                            recon_img = valid_recon_images[idx]
+                            recon_uint8 = _tensor_image_to_uint8(recon_img)
+                            if recon_uint8 is not None:
+                                recon_image_by_sample_idx[sample_idx] = recon_uint8
+                            save_image(
+                                orig_img,
+                                orig_dir / f"step_{current_step}_original{name}_{idx:03d}_sid{sample_idx}.png",
+                            )
+                            save_image(
+                                recon_img,
+                                recon_dir / f"step_{current_step}_recon{name}_{idx:03d}_sid{sample_idx}.png",
+                            )
+
+                        if use_wandb:
+                            # Create grids for wandb logging
+                            orig_grid = make_grid(valid_orig_images, nrow=4)
+                            recon_grid = make_grid(valid_recon_images, nrow=4)
+                            wandb.log(
+                                {
+                                    f"val{name}/original": wandb.Image(orig_grid),
+                                    f"val{name}/reconstructed": wandb.Image(recon_grid),
+                                },
+                                step=current_step,
+                            )
+
+                    save_patch_scores(
+                        valid_patch_records,
+                        patch_score_dir,
+                        val_dataset=val_dataset,
+                        eval_resolution=args.eval_resolution,
+                        vis_max_samples=args.eval_num_image_log,
+                        selected_sample_indices=shared_sample_indices if len(shared_sample_indices) > 0 else None,
+                        recon_image_by_sample_idx=recon_image_by_sample_idx if len(recon_image_by_sample_idx) > 0 else None,
+                    )
+                    log_patch_scores_to_wandb(valid_patch_records, current_step, f"val{name}", use_wandb=use_wandb)
+                    if use_wandb:
+                        wandb.log({f"val{name}/psnr": valid_psnr}, step=current_step)
+                        wandb.log({f"val{name}/lpips": valid_lpips}, step=current_step)
 
                     # Log validation metrics to CSV
                     if csv_writer is not None:
                         try:
-                            csv_writer.writerow({
+                            val_row = {
                                 "step": current_step,
                                 "generator_loss": "",
                                 "discriminator_loss": "",
                                 "rec_loss": "",
+                                "perceptual_loss": "",
                                 "kl_loss": "",
                                 "wavelet_loss": "",
-                                "psnr": valid_psnr,
-                                "lpips": valid_lpips
-                            })
-                            csv_file.flush()
+                                "psnr": "",
+                                "lpips": "",
+                                "psnr_ema": "",
+                                "lpips_ema": "",
+                            }
+                            should_write_val_row = True
+                            if is_ema:
+                                if csv_supports_ema_columns:
+                                    val_row["psnr_ema"] = _to_csv_scalar(valid_psnr)
+                                    val_row["lpips_ema"] = _to_csv_scalar(valid_lpips)
+                                else:
+                                    should_write_val_row = False
+                                    if not csv_warned_ema_legacy:
+                                        logger.warning(
+                                            "Skipped EMA validation CSV row because resumed CSV "
+                                            "does not have `psnr_ema/lpips_ema` columns."
+                                        )
+                                        csv_warned_ema_legacy = True
+                            else:
+                                val_row["psnr"] = _to_csv_scalar(valid_psnr)
+                                val_row["lpips"] = _to_csv_scalar(valid_lpips)
+
+                            if should_write_val_row:
+                                csv_writer.writerow(val_row)
+                                csv_file.flush()
                         except Exception as e:
                             logger.error(f"Failed to write validation metrics to CSV: {e}")
 
-                    logger.info(f"{name} PatchGAN patch scores saved to `{patch_score_dir}`.")
+                    logger.info(f"{name} PatchGAN patch scores saved to `{patch_score_dir}` (summary.csv + patch_vis/*.png).")
                     logger.info(f"{name} Validation done.")
 
             if current_step % args.eval_steps == 0 or current_step == 1:
@@ -1102,14 +1468,15 @@ def main():
     parser.add_argument("--logvar_init", type=float, default=0.0, help="log variance initialization")
     parser.add_argument("--csv_log_steps", type=int, default=50, help="log losses to CSV every N steps")
     parser.add_argument("--disable_plot", action="store_true", help="disable automatic plot generation")
+    parser.add_argument("--disable_wandb", action="store_true", help="disable wandb logging")
 
     # Validation
     parser.add_argument("--eval_steps", type=int, default=1000, help="evaluate every N steps")
     parser.add_argument("--eval_image_path", type=str, default=None, help="path to validation images")
     parser.add_argument("--eval_resolution", type=int, default=256, help="validation image resolution")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="validation batch size")
-    parser.add_argument("--eval_subset_size", type=int, default=100, help="number of validation samples (<=0 means full set)")
-    parser.add_argument("--eval_num_image_log", type=int, default=8, help="number of images to log")
+    parser.add_argument("--eval_subset_size", type=int, default=30, help="number of validation samples (<=0 means full set)")
+    parser.add_argument("--eval_num_image_log", type=int, default=20, help="number of images to log")
     parser.add_argument("--eval_lpips", action="store_true", help="compute LPIPS during validation")
 
     # Dataset
@@ -1120,6 +1487,8 @@ def main():
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate")
 
     args = parser.parse_args()
+    if args.csv_log_steps <= 0:
+        raise ValueError(f"`--csv_log_steps` must be > 0, got {args.csv_log_steps}")
 
     set_random_seed(args.seed)
     train(args)

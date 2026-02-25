@@ -1,228 +1,178 @@
-# Image VAE Training Guide
+# Image VAE 训练指南（当前仓库版本）
 
-本指南说明如何使用 `causalimagevae` 训练图像 VAE 模型。
+本文档对应当前仓库的真实训练流程，推荐使用 `train_wfivae.sh` 启动。
 
-## 环境准备
+## 1. 训练入口与核心文件
 
-确保您已安装以下依赖：
-```bash
-pip install torch torchvision diffusers einops lpips wandb pillow
-```
+- 推荐入口：`train_wfivae.sh`
+- 底层训练器：`train_image_ddp.py`
+- 模型配置：`examples/wfivae2-image-1024.json`
+- 图像模型代码：`causalimagevae/`
 
-## 文件说明
+注意：仓库当前没有 `train_image_ddp.sh`，也没有 `examples/wfivae2-image.json`。
 
-- `train_image_ddp.py` - 分布式训练脚本（图像版本）
-- `train_image_ddp.sh` - 训练启动脚本
-- `causalimagevae/` - 图像 VAE 模块
-- `examples/wfivae2-image.json` - 模型配置文件
-
-## 快速开始
-
-### 1. 准备数据集
-
-将您的图像放在一个目录中，支持的格式：`jpg`, `jpeg`, `png`, `webp`, `bmp`
-
-```
-/path/to/your/images/
-    ├── image1.jpg
-    ├── image2.png
-    └── ...
-```
-
-### 2. 修改训练脚本
-
-编辑 `train_image_ddp.sh`，更新以下参数：
+## 2. 环境准备
 
 ```bash
---image_path /path/to/your/images \
---eval_image_path /path/to/your/validation/images \
---model_config examples/wfivae2-image.json \
+conda create -n wfvae python=3.10 -y
+conda activate wfvae
+pip install -r requirements.txt
 ```
 
-### 3. 启动训练
+## 3. 数据准备
+
+`train_wfivae.sh` 期望你提供一个“总清单”JSONL（通过 `ORIGINAL_MANIFEST`）。脚本会自动随机划分训练/验证并生成临时清单。
+
+清单格式（每行一个 JSON）：
+
+```jsonl
+{"image_path": "/abs/or/rel/path/to/image1.jpg"}
+{"image_path": "relative/path/to/image2.png"}
+```
+
+说明：`image_path` 支持绝对或相对路径。相对路径时，`manifest` 文件所在目录会作为基准目录。
+
+## 4. 快速开始（推荐）
 
 ```bash
-# 单机 8 卡训练
-bash train_image_ddp.sh
+cd /Users/ryuichi/Desktop/renxing/WFVAE-series/WF-VAE-8x_disc_start_5
 
-# 或者使用 torchrun 直接运行
-torchrun --nproc_per_node=8 train_image_ddp.py \
-    --exp_name WFIVAE_test \
-    --image_path /path/to/images \
-    --eval_image_path /path/to/val_images \
-    --model_name WFIVAE2 \
-    --model_config examples/wfivae2-image.json \
-    --resolution 256 \
-    --batch_size 4 \
-    --lr 1e-5 \
-    --epochs 10 \
-    --eval_lpips \
-    --ema \
-    --wavelet_loss
+GPU=0,1,2,3 \
+ORIGINAL_MANIFEST=/path/to/all_images.jsonl \
+OUTPUT_DIR=/path/to/output \
+DISABLE_WANDB=1 \
+RESOLUTION=1024 \
+EVAL_SUBSET_SIZE=0 \
+bash train_wfivae.sh
 ```
 
-## 主要参数说明
+关键点：
 
-### 数据参数
-- `--image_path` - 训练图像路径
-- `--eval_image_path` - 验证图像路径
-- `--resolution` - 图像分辨率（默认256）
-- `--batch_size` - 批次大小
+- `EVAL_SUBSET_SIZE=0` 表示验证集全量（推荐用于完整 patch 分数导出）。
+- 脚本会用 `torchrun` 启动 DDP。
+- 训练结束或中断时会清理临时 `train_manifest.jsonl` / `eval_manifest.jsonl`。
 
-### 模型参数
-- `--model_name` - 模型名称（使用 `WFIVAE2`）
-- `--model_config` - 模型配置文件路径
-- `--latent_dim` - 潜在空间维度（在配置文件中设置）
+## 5. 常用环境变量（train_wfivae.sh）
 
-### 训练参数
-- `--lr` - 学习率（默认 1e-5）
-- `--epochs` - 训练轮数
-- `--mix_precision` - 混合精度（bf16/fp16/fp32）
-- `--ema` - 使用 EMA
-- `--ema_decay` - EMA 衰减率（默认 0.999）
+| 环境变量 | 作用 | 默认值 |
+|---|---|---|
+| `GPU` | 使用的 GPU 列表 | `0` |
+| `ORIGINAL_MANIFEST` | 总数据清单路径 | `/mnt/goosefs-lite-mnt/image_manifest.jsonl` |
+| `OUTPUT_DIR` | 输出目录 | `/mnt/sdc/WF-VAE-8x_disc_start_5_PatchGANScore_30w` |
+| `DISABLE_WANDB` | 是否关闭 wandb（`1/true/yes` 关闭） | `1` |
+| `WANDB_PROJECT` | wandb 项目名（仅在启用 wandb 时生效） | `WFIVAE` |
+| `RESOLUTION` | 训练分辨率 | `1024` |
+| `MODEL_CONFIG` | 模型配置文件 | 分辨率对应默认值 |
+| `EXP_NAME` | 实验名 | 分辨率对应默认值 |
+| `BATCH_SIZE` | 每卡训练 batch size | 1024: `2`, 512: `8` |
+| `EVAL_BATCH_SIZE` | 验证 batch size | 1024: `2`, 512: `4` |
+| `TRAIN_RATIO` | 训练集划分比例 | `0.9` |
+| `MAX_STEPS` | 最大训练步数 | `100000` |
+| `SAVE_CKPT_STEP` | checkpoint 间隔 | `2000` |
+| `EVAL_STEPS` | 验证间隔 | `1000` |
+| `EVAL_SUBSET_SIZE` | 验证样本数（`<=0` 全量） | `0` |
+| `EVAL_NUM_IMAGE_LOG` | 每次验证保存图像数量（并对齐 patch 可视化样本） | `20` |
+| `CSV_LOG_STEPS` | CSV 记录间隔 | `50` |
+| `LOG_STEPS` | W&B/日志记录间隔 | `10` |
+| `DATASET_NUM_WORKER` | dataloader worker 数 | `8` |
+| `RESUME_CKPT` | 恢复训练 checkpoint | 空 |
 
-### 损失参数
-- `--disc_start` - 判别器开始训练的步数（默认 5000）
-- `--disc_weight` - 判别器损失权重（默认 0.5）
-- `--kl_weight` - KL 散度权重（默认 1e-6）
-- `--perceptual_weight` - 感知损失权重（默认 1.0）
-- `--wavelet_loss` - 使用小波损失
-- `--wavelet_weight` - 小波损失权重（默认 0.1）
+如果要启用 wandb，请设置 `DISABLE_WANDB=0`，并先执行 `wandb login`。
 
-### 验证参数
-- `--eval_steps` - 验证间隔步数（默认 1000）
-- `--eval_batch_size` - 验证批次大小
-- `--eval_subset_size` - 验证样本数量
-- `--eval_lpips` - 计算 LPIPS 指标
+## 6. 输出产物
 
-## 模型配置
+在 `${OUTPUT_DIR}/${EXP_NAME}-lr...-bs...-rs.../` 下会生成：
 
-`examples/wfivae2-image.json` 配置示例：
+- `training_losses.csv`
+- `training_curves.png`（每次验证后更新）
+- `training_curves_final.png`（训练结束）
+- `checkpoint-*.ckpt`
+- `val_images/original/` 与 `val_images/reconstructed/`
+- `val_patch_scores/step_xxxxxxxx/`
+- `val_patch_scores/step_xxxxxxxx_ema/`
 
-```json
-{
-  "_class_name": "WFIVAE2Model",
-  "latent_dim": 4,
-  "base_channels": [128, 256, 512],
-  "encoder_num_resblocks": 2,
-  "encoder_energy_flow_size": 128,
-  "decoder_num_resblocks": 3,
-  "decoder_energy_flow_size": 128,
-  "dropout": 0.0,
-  "norm_type": "layernorm",
-  "mid_layers_type": ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"]
-}
-```
+每个 `val_patch_scores` 目录包含：
 
-## 架构说明
+- `summary.csv`
+- `patch_vis/real/*.png`（原图 + patch 热力图 + 叠加图）
+- `patch_vis/recon/*.png`（原图 + 重建打分热力图 + 叠加图）
 
-### CausalImageVAE 与 CausalVideoVAE 的区别
+## 7. 训练监控
 
-| 特性 | CausalVideoVAE | CausalImageVAE |
-|------|---------------|----------------|
-| 输入维度 | (B, 3, T, H, W) | (B, 3, H, W) |
-| Haar 变换 | 3D (24 通道) | 2D (12 通道) |
-| 卷积类型 | CausalConv3d | Conv2d |
-| 采样 | 时空采样 | 空间采样 |
-| 注意力 | Attention3D | Attention2D |
+W&B 常见指标：
 
-### 模型组件
-1. **WFDownBlock** - 带能量流的下采样块（2D Haar + 空间下采样）
-2. **WFUpBlock** - 带能量流的上采样块（2D Haar + 空间上采样）
-3. **Encoder** - 编码器（Conv2d + ResnetBlock2D + Attention2D）
-4. **Decoder** - 解码器（对称结构）
+- `train/generator_loss`
+- `train/discriminator_loss`
+- `train/rec_loss`
+- `val/psnr`
+- `val/lpips`
+- `val/patch_*`（patch 分数均值和直方图，含 EMA 与非 EMA）
 
-## 监控和日志
+训练曲线图当前面板为：
 
-训练过程会记录到 WandB：
+- `generator_loss`
+- `discriminator_loss`
+- `rec_loss`
+- `perceptual_loss`
+- `kl_loss`
+- `wavelet_loss`
+- `psnr`
+- `lpips`
+- `psnr_ema`
+- `lpips_ema`
 
-```python
-export WANDB_PROJECT=WFIVAE
-```
+说明：
 
-主要监控指标：
-- `train/generator_loss` - 生成器损失
-- `train/discriminator_loss` - 判别器损失
-- `train/rec_loss` - 重建损失
-- `val/psnr` - 峰值信噪比
-- `val/lpips` - 感知损失
+- CSV 会把验证指标拆分为 `psnr/lpips`（非 EMA）与 `psnr_ema/lpips_ema`（EMA），避免混写。
 
-## Checkpoint 管理
-
-Checkpoint 保存在 `--ckpt_dir` 指定的目录：
-
-```
-./results/WFIVAE-lr1.00e-05-bs4-rs256/
-    ├── checkpoint-1000.ckpt
-    ├── checkpoint-2000.ckpt
-    └── ...
-```
-
-### 从 Checkpoint 恢复训练
+## 8. 手动 torchrun 启动（调试用）
 
 ```bash
 torchrun --nproc_per_node=8 train_image_ddp.py \
-    --resume_from_checkpoint ./results/xxx/checkpoint-1000.ckpt \
-    [其他参数...]
+  --exp_name WFIVAE2-1024-disc5 \
+  --image_path /path/to/train_manifest.jsonl \
+  --eval_image_path /path/to/eval_manifest.jsonl \
+  --use_manifest \
+  --model_name WFIVAE2 \
+  --model_config examples/wfivae2-image-1024.json \
+  --ckpt_dir /path/to/output \
+  --resolution 1024 \
+  --batch_size 2 \
+  --max_steps 100000 \
+  --eval_steps 1000 \
+  --eval_subset_size 0 \
+  --eval_lpips \
+  --ema \
+  --wavelet_loss
 ```
 
-## 推理使用
+## 9. 常见问题
 
-训练完成后，可以使用模型进行推理：
+### 9.1 OOM
 
-```python
-from causalimagevae.model.vae import WFIVAE2Model
-import torch
-from PIL import Image
-import torchvision.transforms as T
+- 减小 `BATCH_SIZE`
+- 减小 `EVAL_BATCH_SIZE`
+- 使用 `--mix_precision fp16`（如硬件不适合 bf16）
+- 降低 `DATASET_NUM_WORKER`
 
-# 加载模型
-model = WFIVAE2Model.from_pretrained("path/to/checkpoint")
-model.eval()
-model.cuda()
+### 9.2 patch 分数没有全量输出
 
-# 准备图像
-transform = T.Compose([
-    T.Resize(256),
-    T.CenterCrop(256),
-    T.ToTensor(),
-    T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-])
+确认：`EVAL_SUBSET_SIZE=0` 或显式设置为 `<=0`。
 
-image = Image.open("test.jpg")
-img_tensor = transform(image).unsqueeze(0).cuda()
+### 9.3 `MAX_STEPS` 不生效
 
-# 编码
-with torch.no_grad():
-    latent = model.encode(img_tensor).latent_dist.sample()
-    print(f"Latent shape: {latent.shape}")
-    
-    # 解码
-    reconstructed = model.decode(latent).sample
-    
-    # 保存重建图像
-    reconstructed = (reconstructed + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-    T.ToPILImage()(reconstructed[0]).save("reconstructed.jpg")
+当前版本已生效；到达阈值后会打印 `Reached max_steps=...` 并停止训练。
+
+## 10. 推理/重建
+
+单图重建脚本：`scripts/recon_single_image.py`
+
+```bash
+python scripts/recon_single_image.py \
+  --model_name WFIVAE2 \
+  --from_pretrained /path/to/model \
+  --image_path assets/gt_5544.jpg \
+  --rec_path rec.jpg \
+  --device cuda \
+  --short_size 1024
 ```
-
-## 常见问题
-
-### 1. 内存不足
-- 减小 `--batch_size`
-- 减小 `--resolution`
-- 使用 `--mix_precision fp16`
-
-### 2. 训练不稳定
-- 增大 `--disc_start`（延迟判别器训练）
-- 减小 `--disc_weight`
-- 调整 `--lr`
-
-### 3. 重建质量差
-- 增加 `--perceptual_weight`
-- 启用 `--wavelet_loss`
-- 增加训练步数
-
-## 参考资料
-
-- 原始论文：WF-VAE: Wavelet Flow VAE
-- GitHub: [WF-VAE-main](https://github.com/xxx/WF-VAE)
