@@ -77,13 +77,17 @@ Key: the decoder is fully independent — no skip connections from encoder. Ener
 
 ### Training Loop Design
 
-`train_image_ddp.py` uses **alternating optimization**: odd steps optimize the discriminator, even steps optimize the generator. The discriminator activates at `--disc_start` (default 80000, this repo uses 5). Discriminator weight is computed adaptively based on gradient norms of the last decoder layer.
+`train_image_ddp.py` uses **alternating optimization** via `current_step % 2`: even steps (0, 2, 4…) optimize the generator, odd steps (1, 3, 5…) optimize the discriminator. The discriminator only activates when `current_step >= disc_start` (default 80000, this repo uses 5). Discriminator weight is computed adaptively based on gradient norms of the last decoder layer.
 
 **Combined loss** (generator step):
 ```
 generator_loss = rec_loss/exp(logvar) + logvar + perceptual_loss + kl_loss + disc_loss + wavelet_loss
 ```
 where `disc_loss = -mean(D(recon)) * adaptive_weight * disc_factor` and `wavelet_loss = l1(encoder_coeffs, decoder_coeffs_reversed)`.
+
+Mixed precision: default bfloat16 (`--mix_precision bf16`), also supports `fp16` and `fp32`. Uses `torch.amp.GradScaler`.
+
+Signal handling: Ctrl+C triggers graceful shutdown — saves `training_curves_interrupted.png` and exits cleanly on rank 0. Image normalization: input/output in [-1, 1] range (torchvision `Normalize([0.5]*3, [0.5]*3)`).
 
 ### Checkpoint Format
 
@@ -132,6 +136,9 @@ model = model_cls.from_config("examples/wfivae2-image-1024.json")
 |-----------|---------|-------------|
 | `--csv_log_steps` | 50 | Log losses to CSV every N steps |
 | `--disable_plot` | False | Disable automatic plot generation |
+| `--disable_wandb` | False | Disable WandB logging (wandb is optional import) |
+| `--eval_subset_size` | 30 | Validation subset size (0 = full set) |
+| `--eval_num_image_log` | 20 | Number of validation images to save and visualize |
 
 CSV fields: `step, generator_loss, discriminator_loss, rec_loss, kl_loss, wavelet_loss, psnr, lpips`. Output to `{ckpt_dir}/training_losses.csv`.
 
@@ -163,6 +170,23 @@ Images organized recursively in directories (jpg/png/webp/bmp). File list is cac
 {"image_path": "/path/to/image.jpg"}
 ```
 Manifest supports field name aliases: `image_path`, `path`, or `target`.
+
+## `train_wfivae.sh` Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GPU` | `0` | GPU indices, e.g. `0,1,2,3` for multi-GPU DDP |
+| `RESOLUTION` | `1024` | Image resolution (1024 or 512) |
+| `BATCH_SIZE` | `2` (1024px) / `8` (512px) | Per-GPU batch size |
+| `MAX_STEPS` | `1000000` | Maximum training steps |
+| `EVAL_STEPS` | `1000` | Validation interval |
+| `SAVE_CKPT_STEP` | `2000` | Checkpoint save interval |
+| `EVAL_SUBSET_SIZE` | `30` | Validation subset (0 = full set) |
+| `RESUME_CKPT` | — | Path to checkpoint for resumption |
+| `ORIGINAL_MANIFEST` | `./ssk_image_manifest.jsonl` | JSONL manifest path |
+| `OUTPUT_DIR` | `/mnt/sdc/{project_name}` | Output directory |
+| `DISABLE_WANDB` | `1` | `1`/`true`/`yes` to disable WandB |
+| `TRAIN_RATIO` | `0.9` | Train/val split ratio |
 
 ## Distributed Training Notes
 

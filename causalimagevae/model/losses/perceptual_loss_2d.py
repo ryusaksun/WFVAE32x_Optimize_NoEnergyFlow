@@ -128,19 +128,22 @@ class LPIPSWithDiscriminator(nn.Module):
                 wl_loss = 0
                 for enc_c, dec_c in zip(enc_coeffs, dec_coeffs_reversed):
                     wl_loss += torch.sum(l1(enc_c, dec_c)) / bs
-                wl_loss = wl_loss / len(enc_coeffs)
             else:
                 wl_loss = torch.tensor(0.0, device=inputs.device)
 
             # GAN loss
-            logits_fake = self.discriminator(reconstructions)
-            g_loss = -torch.mean(logits_fake)
-
-            d_weight = torch.tensor(0.0, device=inputs.device)
-            if last_layer is not None:
-                d_weight = self.calculate_adaptive_weight(
-                    nll_loss, g_loss, last_layer=last_layer
-                )
+            if global_step >= self.discriminator_iter_start:
+                logits_fake = self.discriminator(reconstructions)
+                g_loss = -torch.mean(logits_fake)
+                if self.disc_factor > 0.0:
+                    d_weight = self.calculate_adaptive_weight(
+                        nll_loss, g_loss, last_layer=last_layer
+                    )
+                else:
+                    d_weight = torch.tensor(1.0, device=inputs.device)
+            else:
+                d_weight = torch.tensor(0.0, device=inputs.device)
+                g_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
             disc_factor = adopt_weight(
                 self.disc_factor, global_step, threshold=self.discriminator_iter_start

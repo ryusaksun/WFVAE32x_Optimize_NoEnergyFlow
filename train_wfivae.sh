@@ -32,7 +32,7 @@
 #    EVAL_SUBSET_SIZE=0 bash train_wfivae.sh
 #
 # 9. 覆盖训练步频参数：
-#    EVAL_STEPS=500 SAVE_CKPT_STEP=1000 MAX_STEPS=50000 bash train_wfivae.sh
+#    EVAL_STEPS=500 SAVE_CKPT_STEP=1000 EPOCHS=500 bash train_wfivae.sh
 #
 # ============================================
 
@@ -104,17 +104,17 @@ DEFAULT_MANIFEST="${SCRIPT_DIR}/ssk_image_manifest.jsonl"
 ORIGINAL_MANIFEST="${ORIGINAL_MANIFEST:-$DEFAULT_MANIFEST}"
 
 # 输出目录 (默认放在 /mnt/sdc 下，包含项目名以区分实验)
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdc/${PROJECT_NAME}}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdb/${PROJECT_NAME}}"
 
 # 临时划分文件路径 (放在输出目录下)
 TRAIN_MANIFEST="${OUTPUT_DIR}/train_manifest.jsonl"
 EVAL_MANIFEST="${OUTPUT_DIR}/eval_manifest.jsonl"
 
 # 分辨率配置 (默认 1024)
-RESOLUTION="${RESOLUTION:-1024}"
+RESOLUTION="${RESOLUTION:-256}"
 
 # 训练/验证步频与日志配置（可通过环境变量覆盖）
-MAX_STEPS="${MAX_STEPS:-1000000}"
+EPOCHS="${EPOCHS:-1000}"
 SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-2000}"
 EVAL_STEPS="${EVAL_STEPS:-1000}"
 EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-30}"     # 验证子集大小，0 表示使用完整验证集
@@ -129,11 +129,15 @@ if [ "$RESOLUTION" = "1024" ]; then
     DEFAULT_EXP_NAME="WFIVAE2-1024-disc5"
     BATCH_SIZE="${BATCH_SIZE:-2}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
-else
-    # 仓库中当前没有 examples/wfivae2-image.json，默认回退到 1024 配置文件；
-    # 如需专门的 512 配置，请通过 MODEL_CONFIG=/path/to/your_512_config.json 覆盖。
+elif [ "$RESOLUTION" = "256" ]; then
     DEFAULT_MODEL_CONFIG="examples/wfivae2-image-1024.json"
-    DEFAULT_EXP_NAME="WFIVAE2-512-disc5"
+    DEFAULT_EXP_NAME="WFIVAE2-256-disc5"
+    BATCH_SIZE="${BATCH_SIZE:-16}"
+    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
+else
+    # 512 或其他分辨率，模型配置通用（无分辨率参数）
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-1024.json"
+    DEFAULT_EXP_NAME="WFIVAE2-${RESOLUTION}-disc5"
     BATCH_SIZE="${BATCH_SIZE:-8}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 fi
@@ -245,7 +249,7 @@ echo "实验名称: $EXP_NAME"
 echo "分辨率: ${RESOLUTION}x${RESOLUTION}"
 echo "训练集比例: $TRAIN_RATIO"
 echo "GPU: $GPU ($NUM_GPUS 卡)"
-echo "最大训练步数: $MAX_STEPS"
+echo "训练 Epochs: $EPOCHS"
 echo "Checkpoint间隔: $SAVE_CKPT_STEP"
 echo "验证间隔: $EVAL_STEPS"
 echo "WandB: $WANDB_STATUS"
@@ -265,11 +269,8 @@ echo "  - WF-VAE: Wavelet-driven energy Flow VAE"
 echo "  - Multi-level Haar Wavelet Transform"
 echo "  - Energy flow pathway for frequency info"
 echo "  - 压缩比: 8倍"
-if [ "$RESOLUTION" = "512" ]; then
-    echo "  - 潜变量: [B, latent_dim, 64, 64]"
-else
-    echo "  - 潜变量: [B, latent_dim, 128, 128]"
-fi
+LATENT_H=$((RESOLUTION / 8))
+echo "  - 潜变量: [B, latent_dim, ${LATENT_H}, ${LATENT_H}]"
 echo "================================================"
 
 # 显示resume信息
@@ -335,7 +336,7 @@ TRAIN_ARGS="train_image_ddp.py \
     --batch_size $BATCH_SIZE \
     --lr 1e-5 \
     --weight_decay 1e-4 \
-    --max_steps $MAX_STEPS \
+    --epochs $EPOCHS \
     --save_ckpt_step $SAVE_CKPT_STEP \
     --eval_steps $EVAL_STEPS \
     --eval_resolution $RESOLUTION \
