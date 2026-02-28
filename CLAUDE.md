@@ -27,7 +27,13 @@ GPU=0,1,2,3 bash train_wfivae.sh
 RESUME_CKPT="/path/to/checkpoint.ckpt" bash train_wfivae.sh
 
 # Override common parameters
-RESOLUTION=512 BATCH_SIZE=8 MAX_STEPS=50000 EVAL_STEPS=500 bash train_wfivae.sh
+RESOLUTION=512 BATCH_SIZE=8 EPOCHS=500 EVAL_STEPS=500 bash train_wfivae.sh
+
+# Resume and refresh dead discriminator (reinitialize weights + warmup)
+RESUME_CKPT="/path/to/checkpoint.ckpt" REFRESH_DISC=1 bash train_wfivae.sh
+
+# Periodic discriminator refresh every 10k steps
+DISC_REFRESH_EVERY=10000 bash train_wfivae.sh
 
 # Direct torchrun (low-level, requires manual dataset setup)
 torchrun --nproc_per_node=8 train_image_ddp.py \
@@ -85,6 +91,8 @@ generator_loss = rec_loss/exp(logvar) + logvar + perceptual_loss + kl_loss + dis
 ```
 where `disc_loss = -mean(D(recon)) * adaptive_weight * disc_factor` and `wavelet_loss = l1(encoder_coeffs, decoder_coeffs_reversed)`.
 
+**Discriminator refresh**: If the discriminator collapses (disc_loss stuck at 1.0), it can be reinitialized via `--refresh_discriminator` (at resume) or `--disc_refresh_every N` (periodic). After refresh, a warmup period (`--disc_refresh_warmup`, default 100 steps) trains only the discriminator before resuming alternating optimization.
+
 Mixed precision: default bfloat16 (`--mix_precision bf16`), also supports `fp16` and `fp32`. Uses `torch.amp.GradScaler`.
 
 Signal handling: Ctrl+C triggers graceful shutdown — saves `training_curves_interrupted.png` and exits cleanly on rank 0. Image normalization: input/output in [-1, 1] range (torchvision `Normalize([0.5]*3, [0.5]*3)`).
@@ -140,14 +148,14 @@ model = model_cls.from_config("examples/wfivae2-image-1024.json")
 | `--eval_subset_size` | 30 | Validation subset size (0 = full set) |
 | `--eval_num_image_log` | 20 | Number of validation images to save and visualize |
 
-CSV fields: `step, generator_loss, discriminator_loss, rec_loss, kl_loss, wavelet_loss, psnr, lpips`. Output to `{ckpt_dir}/training_losses.csv`.
+CSV fields: `step, generator_loss, discriminator_loss, rec_loss, perceptual_loss, kl_loss, wavelet_loss, logvar, nll_loss, g_loss, d_weight, logits_real, logits_fake, r1_penalty, r1_effective_weight, nll_grads_norm, g_grads_norm, psnr, lpips, psnr_ema, lpips_ema`. Output to `{ckpt_dir}/{exp_name}.csv`. A row with `generator_loss=DISC_REFRESH` marks discriminator refresh events.
 
-Plot files: `training_curves.png` (at checkpoints), `training_curves_final.png` (normal completion), `training_curves_interrupted.png` (Ctrl+C). Features 3×3 subplot layout with smoothed curves and disc_start marker.
+Plot files: `training_curves.png` (at checkpoints), `training_curves_final.png` (normal completion), `training_curves_interrupted.png` (Ctrl+C). Features 7×3 subplot layout with smoothed curves and disc_start marker.
 
 ### Training Output Structure
 
 Under `{ckpt_dir}/{exp_name-lr...-bs...-rs...}/`:
-- `training_losses.csv` — metrics CSV
+- `{exp_name}.csv` — metrics CSV
 - `training_curves*.png` — loss plots
 - `val_images/original/` and `val_images/reconstructed/` — validation images
 - `val_patch_scores/step_xxxxxxxx/` and `step_xxxxxxxx_ema/` — PatchGAN scores with `summary.csv` + `patch_vis/{real,recon}/*.png` heatmaps
@@ -176,17 +184,25 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GPU` | `0` | GPU indices, e.g. `0,1,2,3` for multi-GPU DDP |
-| `RESOLUTION` | `1024` | Image resolution (1024 or 512) |
-| `BATCH_SIZE` | `2` (1024px) / `8` (512px) | Per-GPU batch size |
-| `MAX_STEPS` | `1000000` | Maximum training steps |
+| `RESOLUTION` | `256` | Image resolution (256, 512, or 1024) |
+| `BATCH_SIZE` | `16` (256px) / `2` (1024px) | Per-GPU batch size |
+| `EPOCHS` | `1000` | Training epochs |
 | `EVAL_STEPS` | `1000` | Validation interval |
 | `SAVE_CKPT_STEP` | `2000` | Checkpoint save interval |
 | `EVAL_SUBSET_SIZE` | `30` | Validation subset (0 = full set) |
 | `RESUME_CKPT` | — | Path to checkpoint for resumption |
+| `REFRESH_DISC` | — | Non-empty to reinitialize discriminator at resume |
+| `DISC_REFRESH_EVERY` | `0` | Periodic discriminator refresh interval (0=disabled) |
+| `DISC_REFRESH_WARMUP` | `100` | Disc-only training steps after each refresh |
 | `ORIGINAL_MANIFEST` | `./ssk_image_manifest.jsonl` | JSONL manifest path |
-| `OUTPUT_DIR` | `/mnt/sdc/{project_name}` | Output directory |
+| `OUTPUT_DIR` | `/mnt/sdb/{project_name}` | Output directory |
 | `DISABLE_WANDB` | `1` | `1`/`true`/`yes` to disable WandB |
 | `TRAIN_RATIO` | `0.9` | Train/val split ratio |
+| `MIX_PRECISION` | `bf16` | Training precision: `bf16`, `fp16`, or `fp32` |
+| `ADAPTIVE_WEIGHT_CLAMP` | `1e5` | Max adaptive weight for discriminator |
+| `R1_WEIGHT` | `0` | R1 gradient penalty weight (0=disabled) |
+| `R1_START` | `0` | Step to begin R1 penalty |
+| `R1_WARMUP_STEPS` | `0` | Linear warmup steps for R1 (0=instant) |
 
 ## Distributed Training Notes
 

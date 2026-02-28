@@ -54,6 +54,10 @@ class LPIPSWithDiscriminator(nn.Module):
         learn_logvar: bool = False,
         wavelet_weight=0.01,
         loss_type: str = "l1",
+        adaptive_weight_clamp: float = 1e5,
+        r1_weight: float = 0.0,
+        r1_start: int = 0,
+        r1_warmup_steps: int = 0,
     ):
 
         super().__init__()
@@ -75,6 +79,10 @@ class LPIPSWithDiscriminator(nn.Module):
         self.discriminator_weight = disc_weight
         self.disc_conditional = disc_conditional
         self.loss_func = l1 if loss_type == "l1" else l2
+        self.adaptive_weight_clamp = adaptive_weight_clamp
+        self.r1_weight = r1_weight
+        self.r1_start = r1_start
+        self.r1_warmup_steps = r1_warmup_steps
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
         layer = last_layer if last_layer is not None else self.last_layer[0]
@@ -82,8 +90,12 @@ class LPIPSWithDiscriminator(nn.Module):
         nll_grads = torch.autograd.grad(nll_loss, layer, retain_graph=True)[0]
         g_grads = torch.autograd.grad(g_loss, layer, retain_graph=True)[0]
 
-        d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-6)
-        d_weight = torch.clamp(d_weight, 0.0, 1e6).detach()
+        # 暂存梯度范数供 log dict 使用
+        self._last_nll_grads_norm = torch.norm(nll_grads).detach()
+        self._last_g_grads_norm = torch.norm(g_grads).detach()
+
+        d_weight = self._last_nll_grads_norm / (self._last_g_grads_norm + 1e-6)
+        d_weight = torch.clamp(d_weight, 0.0, self.adaptive_weight_clamp).detach()
         d_weight = d_weight * self.discriminator_weight
         return d_weight
 
@@ -102,7 +114,8 @@ class LPIPSWithDiscriminator(nn.Module):
         bs = inputs.shape[0]
         if optimizer_idx == 0:  # Generator
             # For images: (B, C, H, W) - no need to rearrange
-            rec_loss = self.loss_func(inputs, reconstructions)
+            pixel_rec_loss = self.loss_func(inputs, reconstructions)
+            rec_loss = pixel_rec_loss
             if self.perceptual_weight > 0:
                 p_loss = self.perceptual_loss(inputs, reconstructions)
                 rec_loss = rec_loss + self.perceptual_weight * p_loss
@@ -141,9 +154,13 @@ class LPIPSWithDiscriminator(nn.Module):
                     )
                 else:
                     d_weight = torch.tensor(1.0, device=inputs.device)
+                    self._last_nll_grads_norm = torch.tensor(0.0, device=inputs.device)
+                    self._last_g_grads_norm = torch.tensor(0.0, device=inputs.device)
             else:
                 d_weight = torch.tensor(0.0, device=inputs.device)
                 g_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
+                self._last_nll_grads_norm = torch.tensor(0.0, device=inputs.device)
+                self._last_g_grads_norm = torch.tensor(0.0, device=inputs.device)
 
             disc_factor = adopt_weight(
                 self.disc_factor, global_step, threshold=self.discriminator_iter_start
@@ -160,28 +177,61 @@ class LPIPSWithDiscriminator(nn.Module):
                 f"{split}/logvar": self.logvar.detach(),
                 f"{split}/kl_loss": kl_loss.detach().mean(),
                 f"{split}/nll_loss": nll_loss.detach().mean(),
-                f"{split}/rec_loss": rec_loss.detach().mean(),
+                f"{split}/rec_loss": pixel_rec_loss.detach().mean(),
                 f"{split}/d_weight": d_weight.detach(),
-                f"{split}/disc_factor": torch.tensor(disc_factor),
+                f"{split}/disc_factor": torch.tensor(disc_factor, device=inputs.device),
                 f"{split}/g_loss": g_loss.detach().mean(),
             }
-            log[f"{split}/p_loss"] = p_loss.detach().mean() if self.perceptual_weight > 0 else torch.tensor(0.0)
+            log[f"{split}/p_loss"] = p_loss.detach().mean() if self.perceptual_weight > 0 else torch.tensor(0.0, device=inputs.device)
+            log[f"{split}/nll_grads_norm"] = self._last_nll_grads_norm
+            log[f"{split}/g_grads_norm"] = self._last_g_grads_norm
             if self.wavelet_weight > 0:
                 log[f"{split}/wl_loss"] = wl_loss.detach().mean()
             return loss, log
 
         if optimizer_idx == 1:  # Discriminator
-            logits_real = self.discriminator(inputs.detach())
+            # Compute effective R1 weight with delayed start + linear warmup
+            if self.r1_weight > 0 and global_step >= self.r1_start:
+                if self.r1_warmup_steps > 0 and global_step < self.r1_start + self.r1_warmup_steps:
+                    warmup_progress = (global_step - self.r1_start) / self.r1_warmup_steps
+                    effective_r1 = self.r1_weight * warmup_progress
+                else:
+                    effective_r1 = self.r1_weight
+            else:
+                effective_r1 = 0.0
+
+            real_input = inputs.detach().requires_grad_(effective_r1 > 0)
             logits_fake = self.discriminator(reconstructions.detach())
+
+            # R1 needs fp32 forward for correct second-order gradients
+            if effective_r1 > 0:
+                with torch.amp.autocast('cuda', enabled=False):
+                    logits_real = self.discriminator(real_input.float())
+            else:
+                logits_real = self.discriminator(real_input)
 
             disc_factor = adopt_weight(
                 self.disc_factor, global_step, threshold=self.discriminator_iter_start
             )
             d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
 
+            # R1 gradient penalty
+            if effective_r1 > 0 and disc_factor > 0:
+                r1_grads = torch.autograd.grad(
+                    outputs=logits_real.sum(),
+                    inputs=real_input,
+                    create_graph=True,
+                )[0]
+                r1_penalty = r1_grads.square().sum([1, 2, 3]).mean()
+                d_loss = d_loss + disc_factor * effective_r1 * r1_penalty
+            else:
+                r1_penalty = torch.tensor(0.0, device=inputs.device)
+
             log = {
                 f"{split}/disc_loss": d_loss.clone().detach().mean(),
                 f"{split}/logits_real": logits_real.detach().mean(),
                 f"{split}/logits_fake": logits_fake.detach().mean(),
+                f"{split}/r1_penalty": r1_penalty.detach().mean(),
+                f"{split}/r1_effective_weight": torch.tensor(effective_r1, device=inputs.device),
             }
             return d_loss, log

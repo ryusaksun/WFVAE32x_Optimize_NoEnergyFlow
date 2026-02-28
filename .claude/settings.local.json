@@ -16,7 +16,15 @@
       "Bash(bash:*)",
       "Bash(ls:*)",
       "Bash(grep:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.pytorch.org)",
+      "Bash(find:*)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(gawk NR>1 && $18!=\"\" {step=$1; psnr=$18; lpips=$19} END {print \"non-EMA: step=\"step, \"PSNR=\"psnr, \"LPIPS=\"lpips}:*)",
+      "Bash(echo exit: $?:*)",
+      "Bash(git status:*)"
     ]
   }
 }

@@ -52,7 +52,7 @@ class ManifestImageDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retry=0):
         sample = self.samples[idx]
 
         # Get image path - support multiple field names
@@ -74,8 +74,9 @@ class ManifestImageDataset(Dataset):
             }
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
-            # Return next sample on error
-            return self.__getitem__((idx + 1) % len(self))
+            if _retry >= 10:
+                raise RuntimeError(f"Failed to load image after {_retry} retries, last path: {image_path}")
+            return self.__getitem__((idx + 1) % len(self), _retry=_retry + 1)
 
 
 class ValidManifestImageDataset(Dataset):
@@ -121,7 +122,7 @@ class ValidManifestImageDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retry=0):
         sample = self.samples[idx]
 
         # Get image path - support multiple field names
@@ -142,4 +143,7 @@ class ValidManifestImageDataset(Dataset):
             }
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
-            return self.__getitem__(0)
+            if _retry >= 10:
+                raise RuntimeError(f"Failed to load validation image after {_retry} retries, last path: {image_path}")
+            next_idx = (idx + 1) % len(self) if len(self) > 1 else 0
+            return self.__getitem__(next_idx, _retry=_retry + 1)

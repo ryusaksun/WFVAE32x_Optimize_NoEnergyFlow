@@ -341,7 +341,7 @@ class WFIVAE2Model(VideoBaseAE):
         if (
             "ema_state_dict" in sd
             and len(sd["ema_state_dict"]) > 0
-            and os.environ.get("NOT_USE_EMA_MODEL", 0) == 0
+            and os.environ.get("NOT_USE_EMA_MODEL", "0") != "1"
         ):
             print("Load from ema model!")
             sd = sd["ema_state_dict"]

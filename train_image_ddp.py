@@ -8,12 +8,15 @@ import argparse
 import logging
 import tqdm
 from itertools import chain
+from collections import deque
+from contextlib import nullcontext
 import random
 import numpy as np
 from pathlib import Path
 from PIL import Image, ImageDraw
 from causalimagevae.model import *
 from causalimagevae.model.ema_model import EMA
+from causalimagevae.model.losses.discriminator import weights_init
 from causalimagevae.dataset.ddp_sampler import CustomDistributedSampler
 from causalimagevae.dataset.image_dataset import ImageDataset, ValidImageDataset
 from causalimagevae.model.utils.module_utils import resolve_str_to_obj
@@ -26,8 +29,8 @@ except ImportError:
 
 try:
     import lpips
-except:
-    raise Exception("Need lpips to validate.")
+except ImportError:
+    lpips = None
 
 import csv
 import signal
@@ -101,21 +104,22 @@ def save_checkpoint(
     sampler_state,
     checkpoint_dir,
     filename="checkpoint.ckpt",
-    ema_state_dict={},
+    ema_state_dict=None,
+    disc_refresh_state=None,
 ):
     filepath = checkpoint_dir / Path(filename)
-    torch.save(
-        {
-            "epoch": epoch,
-            "current_step": current_step,
-            "optimizer_state": optimizer_state,
-            "state_dict": state_dict,
-            "ema_state_dict": ema_state_dict,
-            "scaler_state": scaler_state,
-            "sampler_state": sampler_state,
-        },
-        filepath,
-    )
+    data = {
+        "epoch": epoch,
+        "current_step": current_step,
+        "optimizer_state": optimizer_state,
+        "state_dict": state_dict,
+        "ema_state_dict": ema_state_dict or {},
+        "scaler_state": scaler_state,
+        "sampler_state": sampler_state,
+    }
+    if disc_refresh_state is not None:
+        data["disc_refresh_state"] = disc_refresh_state
+    torch.save(data, filepath)
     return filepath
 
 def _extract_patch_maps(logits):
@@ -441,13 +445,7 @@ def log_patch_scores_to_wandb(patch_records, step, prefix, use_wandb=True):
         step=step,
     )
 
-def valid(global_rank, rank, model, discriminator, val_dataloader, precision, args):
-    if args.eval_lpips:
-        lpips_model = lpips.LPIPS(net="alex", spatial=True)
-        lpips_model.to(rank)
-        lpips_model = DDP(lpips_model, device_ids=[rank])
-        lpips_model.requires_grad_(False)
-        lpips_model.eval()
+def valid(global_rank, rank, model, discriminator, val_dataloader, precision, args, lpips_model=None):
 
     bar = None
     if global_rank == 0:
@@ -513,9 +511,9 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
                     logged_sample_indices.append(int(sample_indices[i]))
                     num_image_log -= 1
 
-            # Calculate PSNR
+            # Calculate PSNR (data range [-1, 1], so MAX=2)
             mse = torch.mean(torch.square(inputs - image_recon), dim=(1, 2, 3))
-            psnr = 20 * torch.log10(1 / torch.sqrt(mse))
+            psnr = 20 * torch.log10(2.0 / torch.sqrt(mse))
             psnr = psnr.mean().detach().cpu().item()
 
             # Calculate LPIPS
@@ -631,6 +629,13 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         print("Warning: CSV file is empty")
         return
 
+    # Extract discriminator refresh steps from marker rows
+    disc_refresh_steps = []
+    if 'generator_loss' in df.columns:
+        refresh_mask = df['generator_loss'].astype(str).str.strip().isin(['DISC_REFRESH', 'DISC_AUTO_REFRESH'])
+        refresh_rows = df.loc[refresh_mask, 'step']
+        disc_refresh_steps = pd.to_numeric(refresh_rows, errors='coerce').dropna().tolist()
+
     # Define metrics to plot
     metrics = [
         ('generator_loss', 'Generator Loss', 'tab:blue'),
@@ -639,7 +644,17 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         ('perceptual_loss', 'Perceptual Loss', 'tab:brown'),
         ('kl_loss', 'KL Loss', 'tab:red'),
         ('wavelet_loss', 'Wavelet Loss', 'tab:purple'),
-        ('psnr', 'Validation PSNR', 'tab:cyan'),
+        ('logvar', 'Log Variance', 'teal'),
+        ('nll_loss', 'NLL Loss', 'slateblue'),
+        ('g_loss', 'GAN Loss (g_loss)', 'tab:cyan'),
+        ('d_weight', 'Adaptive Weight (d_weight)', 'darkgoldenrod'),
+        ('logits_real', 'Logits Real', 'forestgreen'),
+        ('logits_fake', 'Logits Fake', 'tomato'),
+        ('r1_penalty', 'R1 Penalty', 'crimson'),
+        ('r1_effective_weight', 'R1 Effective Weight', 'hotpink'),
+        ('nll_grads_norm', 'NLL Grad Norm', 'mediumpurple'),
+        ('g_grads_norm', 'GAN Grad Norm', 'coral'),
+        ('psnr', 'Validation PSNR', 'deepskyblue'),
         ('lpips', 'Validation LPIPS', 'tab:olive'),
         ('psnr_ema', 'Validation PSNR (EMA)', 'tab:pink'),
         ('lpips_ema', 'Validation LPIPS (EMA)', 'tab:gray'),
@@ -679,11 +694,14 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         steps = data['step'].values
         values = data[metric_key].values
 
-        # Plot raw data with transparency
-        ax.plot(steps, values, alpha=0.25, color=color, linewidth=0.5, label='Raw')
-
-        # Apply smoothing if we have enough data points
-        if len(values) > smoothing_window:
+        # Sparse metrics (validation) get solid lines + markers;
+        # dense metrics get transparent raw + smoothed overlay
+        is_sparse = len(values) <= smoothing_window
+        if is_sparse:
+            ax.plot(steps, values, color=color, linewidth=1.8,
+                    marker='o', markersize=4, label='Val')
+        else:
+            ax.plot(steps, values, alpha=0.25, color=color, linewidth=0.5, label='Raw')
             try:
                 smoothed = uniform_filter1d(values, size=smoothing_window, mode='nearest')
                 ax.plot(steps, smoothed, color=color, linewidth=2, label=f'Smoothed (w={smoothing_window})')
@@ -696,6 +714,11 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         if disc_start is not None and disc_start > 0:
             ax.axvline(x=disc_start, color='red', linestyle='--',
                       linewidth=1, alpha=0.5)
+
+        # Draw discriminator refresh lines
+        for rs in disc_refresh_steps:
+            ax.axvline(x=rs, color='darkorange', linestyle=':',
+                      linewidth=1.2, alpha=0.7)
 
         ax.set_title(title, fontsize=12)
         ax.set_xlabel('Step', fontsize=10)
@@ -793,7 +816,12 @@ def train(args):
         logvar_init=args.logvar_init,
         perceptual_weight=args.perceptual_weight,
         loss_type=args.loss_type,
-        wavelet_weight=args.wavelet_weight
+        wavelet_weight=args.wavelet_weight,
+        adaptive_weight_clamp=args.adaptive_weight_clamp,
+        r1_weight=args.r1_weight,
+        r1_start=args.r1_start,
+        r1_warmup_steps=args.r1_warmup_steps,
+        learn_logvar=args.learn_logvar,
     )
 
     # DDP
@@ -869,18 +897,33 @@ def train(args):
     for module in modules_to_train:
         parameters_to_train += list(filter(lambda p: p.requires_grad, module.parameters()))
 
-    gen_optimizer = torch.optim.AdamW(parameters_to_train, lr=args.lr, weight_decay=args.weight_decay)
-    disc_optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()), lr=args.lr, weight_decay=args.weight_decay
-    )
+    # logvar controls reconstruction loss scaling — use separate (higher) lr for fast equilibrium
+    if disc.module.logvar.requires_grad:
+        logvar_lr = args.logvar_lr if args.logvar_lr is not None else args.lr
+        gen_param_groups = [
+            {"params": parameters_to_train, "lr": args.lr},
+            {"params": [disc.module.logvar], "lr": logvar_lr, "weight_decay": 0.0},
+        ]
+        logger.info(f"learn_logvar enabled: logvar lr={logvar_lr} (init={disc.module.logvar.item():.4f})")
+    else:
+        gen_param_groups = parameters_to_train
 
-    # AMP scaler
-    scaler = torch.amp.GradScaler('cuda')
+    gen_optimizer = torch.optim.AdamW(gen_param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    disc_lr = args.disc_lr if args.disc_lr is not None else args.lr
+    disc_optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()), lr=disc_lr, weight_decay=args.weight_decay
+    )
+    if disc_lr != args.lr:
+        logger.info(f"TTUR enabled: generator lr={args.lr}, discriminator lr={disc_lr}")
+
+    # AMP scaler — only needed for fp16; bfloat16/fp32 have sufficient dynamic range
     precision = torch.bfloat16
     if args.mix_precision == "fp16":
         precision = torch.float16
     elif args.mix_precision == "fp32":
         precision = torch.float32
+    scaler_enabled = (precision == torch.float16)
+    scaler = torch.amp.GradScaler('cuda', enabled=scaler_enabled)
 
     # load from checkpoint
     start_epoch = 0
@@ -898,24 +941,54 @@ def train(args):
             gen_optimizer.load_state_dict(checkpoint["optimizer_state"]["gen_optimizer"])
 
         # resume discriminator
-        if not args.not_resume_discriminator:
+        if args.refresh_discriminator:
+            # Refresh mode: reload non-discriminator weights (logvar, perceptual_loss),
+            # but reinitialize discriminator weights and optimizer from scratch.
+            full_disc_state = checkpoint["state_dict"]["dics_model"]
+            non_disc_keys = {k: v for k, v in full_disc_state.items() if not k.startswith("discriminator.")}
+            disc.module.load_state_dict(non_disc_keys, strict=False)
+            disc.module.discriminator.apply(weights_init)
+            # Broadcast rank 0 weights to all ranks to keep DDP in sync
+            for param in disc.module.discriminator.parameters():
+                dist.broadcast(param.data, src=0)
+            disc_optimizer = torch.optim.AdamW(
+                filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
+                lr=disc_lr, weight_decay=args.weight_decay,
+            )
+            scaler.load_state_dict(checkpoint["scaler_state"])
+            logger.info("Discriminator REFRESHED at resume (weights reinitialized, optimizer reset).")
+        elif not args.not_resume_discriminator:
             disc.module.load_state_dict(checkpoint["state_dict"]["dics_model"])
-            disc_optimizer.load_state_dict(checkpoint["optimizer_state"]["disc_optimizer"])
+            if not args.not_resume_optimizer:
+                disc_optimizer.load_state_dict(checkpoint["optimizer_state"]["disc_optimizer"])
+                # Override disc lr if --disc_lr is explicitly set (TTUR), since checkpoint saves the old lr
+                if args.disc_lr is not None:
+                    for pg in disc_optimizer.param_groups:
+                        pg['lr'] = disc_lr
+                    logger.info(f"Overriding resumed discriminator lr to {disc_lr} (TTUR)")
             scaler.load_state_dict(checkpoint["scaler_state"])
 
-        # resume data sampler
-        ddp_sampler.load_state_dict(checkpoint["sampler_state"])
-
-        start_epoch = checkpoint["sampler_state"]["epoch"]
-        current_step = checkpoint["current_step"]
-        logger.info(
-            f"Checkpoint loaded from {args.resume_from_checkpoint}, starting from epoch {start_epoch} step {current_step}"
-        )
+        # resume data sampler and training progress
+        if not args.not_resume_training_process:
+            ddp_sampler.load_state_dict(checkpoint["sampler_state"])
+            start_epoch = checkpoint["sampler_state"]["epoch"]
+            current_step = checkpoint["current_step"]
+            logger.info(
+                f"Checkpoint loaded from {args.resume_from_checkpoint}, starting from epoch {start_epoch} step {current_step}"
+            )
+        else:
+            logger.info(
+                f"Checkpoint weights loaded from {args.resume_from_checkpoint}, training process reset (epoch=0, step=0)"
+            )
 
     if args.ema:
         logger.warning(f"Start with EMA. EMA decay = {args.ema_decay}.")
         ema = EMA(model, args.ema_decay)
         ema.register()
+        # Restore EMA shadow weights from checkpoint
+        if args.resume_from_checkpoint and "ema_state_dict" in checkpoint and checkpoint["ema_state_dict"]:
+            ema.shadow = checkpoint["ema_state_dict"]
+            logger.info("EMA shadow weights restored from checkpoint.")
 
     logger.info("Prepared!")
 
@@ -924,15 +997,25 @@ def train(args):
     csv_writer = None
     csv_supports_ema_columns = False
     csv_warned_ema_legacy = False
+    csv_name = f"{args.exp_name}.csv"
     if global_rank == 0:
-        csv_path = ckpt_dir / "training_losses.csv"
+        csv_path = ckpt_dir / csv_name
         fieldnames = [
             "step", "generator_loss", "discriminator_loss",
             "rec_loss", "perceptual_loss", "kl_loss", "wavelet_loss",
+            "logvar", "nll_loss",
+            "g_loss", "d_weight",
+            "logits_real", "logits_fake", "r1_penalty", "r1_effective_weight",
+            "nll_grads_norm", "g_grads_norm",
             "psnr", "lpips", "psnr_ema", "lpips_ema",
         ]
 
-        # Check if resuming from checkpoint
+        # Check if resuming from checkpoint (fall back to old filename)
+        if args.resume_from_checkpoint and not csv_path.exists():
+            legacy_csv = ckpt_dir / "training_losses.csv"
+            if legacy_csv.exists() and legacy_csv.stat().st_size > 0:
+                logger.info(f"Renaming legacy CSV: {legacy_csv} -> {csv_path}")
+                legacy_csv.rename(csv_path)
         resume_csv = (
             args.resume_from_checkpoint
             and csv_path.exists()
@@ -944,7 +1027,19 @@ def train(args):
                 with open(csv_path, "r", newline="") as existing_csv_file:
                     existing_header = next(csv.reader(existing_csv_file), None)
                 if existing_header:
-                    fieldnames = existing_header
+                    # Merge: keep existing columns and append any new ones
+                    missing_cols = [c for c in fieldnames if c not in existing_header]
+                    if missing_cols:
+                        logger.info(f"Upgrading CSV: adding new columns {missing_cols}")
+                        fieldnames = existing_header + missing_cols
+                        # Rewrite file with updated header (old data rows unchanged)
+                        with open(csv_path, "r", newline="") as f:
+                            old_lines = f.readlines()
+                        with open(csv_path, "w", newline="") as f:
+                            f.write(",".join(fieldnames) + "\n")
+                            f.writelines(old_lines[1:])  # skip old header
+                    else:
+                        fieldnames = existing_header
             except Exception as e:
                 logger.warning(f"Failed to read CSV header from `{csv_path}`: {e}")
 
@@ -987,7 +1082,7 @@ def train(args):
             # Generate final plot with '_interrupted' suffix
             if not args.disable_plot:
                 try:
-                    csv_path = ckpt_dir / "training_losses.csv"
+                    csv_path = ckpt_dir / csv_name
                     plot_path = ckpt_dir / f"training_curves_interrupted_step{current_step}.png"
                     logger.info(f"Generating interrupted training plot at {plot_path}")
                     plot_training_curves(
@@ -1009,10 +1104,9 @@ def train(args):
 
         sys.exit(0)
 
-    # Register signal handlers (only on rank 0 to avoid race conditions)
-    if global_rank == 0:
-        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler)  # kill command
+    # Register signal handlers on all ranks so non-rank-0 processes also exit cleanly
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill command
 
     dist.barrier()
     if global_rank == 0:
@@ -1022,6 +1116,17 @@ def train(args):
         logger.info(f"Discriminator:\t{total_params(disc.module):d}M")
         logger.info(f"Precision is set to: {args.mix_precision}!")
         logger.info("Start training!")
+
+    # Create LPIPS model once for validation (avoid recreating DDP wrapper each time)
+    val_lpips_model = None
+    if args.eval_lpips:
+        if lpips is None:
+            raise ImportError("lpips is required when --eval_lpips is enabled. Install with: pip install lpips")
+        val_lpips_model = lpips.LPIPS(net="alex", spatial=True)
+        val_lpips_model.to(rank)
+        val_lpips_model = DDP(val_lpips_model, device_ids=[rank])
+        val_lpips_model.requires_grad_(False)
+        val_lpips_model.eval()
 
     # training bar
     bar_desc = "Epoch: {current_epoch}, Loss: {loss}"
@@ -1045,13 +1150,28 @@ def train(args):
     last_gen_csv_logged_step = -args.csv_log_steps
     last_disc_csv_logged_step = -args.csv_log_steps
 
+    # Discriminator refresh tracking
+    last_disc_refresh_step = None
+    disc_loss_buffer = deque(maxlen=args.disc_stale_window)
+    if args.refresh_discriminator and args.resume_from_checkpoint:
+        last_disc_refresh_step = current_step
+        if global_rank == 0:
+            logger.info(f"Discriminator warmup active for {args.disc_refresh_warmup} steps starting at step {current_step}.")
+    elif args.resume_from_checkpoint and args.disc_auto_refresh and "disc_refresh_state" in checkpoint:
+        drs = checkpoint["disc_refresh_state"]
+        last_disc_refresh_step = drs.get("last_disc_refresh_step")
+        saved_buffer = drs.get("disc_loss_buffer", [])
+        disc_loss_buffer.extend(saved_buffer)
+        if global_rank == 0:
+            logger.info(f"Disc refresh state restored: last_refresh_step={last_disc_refresh_step}, buffer_len={len(disc_loss_buffer)}")
+
     def update_bar(bar):
         if global_rank == 0:
             bar.desc = bar_desc.format(current_epoch=epoch, loss=f"-")
             bar.update()
 
     # training Loop
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         set_train(modules_to_train)
         ddp_sampler.set_epoch(epoch)  # Shuffle data at every epoch
 
@@ -1062,16 +1182,114 @@ def train(args):
 
             inputs = batch["image"].to(rank)
 
-            # select generator or discriminator
+            # --- Periodic discriminator refresh ---
             if (
+                args.disc_refresh_every > 0
+                and current_step > 0
+                and current_step % args.disc_refresh_every == 0
+                and (last_disc_refresh_step is None or current_step != last_disc_refresh_step)
+            ):
+                disc.module.discriminator.apply(weights_init)
+                # Broadcast rank 0 weights to all ranks to keep DDP in sync
+                for param in disc.module.discriminator.parameters():
+                    dist.broadcast(param.data, src=0)
+                disc_optimizer = torch.optim.AdamW(
+                    filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
+                    lr=disc_lr, weight_decay=args.weight_decay,
+                )
+                last_disc_refresh_step = current_step
+                if global_rank == 0:
+                    logger.info(f"[Disc Refresh] Periodic refresh at step {current_step}, warmup for {args.disc_refresh_warmup} steps.")
+                    if csv_writer is not None:
+                        try:
+                            csv_writer.writerow({
+                                "step": current_step,
+                                "generator_loss": "DISC_REFRESH",
+                                "discriminator_loss": "", "rec_loss": "",
+                                "perceptual_loss": "", "kl_loss": "",
+                                "wavelet_loss": "", "logvar": "", "nll_loss": "",
+                                "g_loss": "", "d_weight": "",
+                                "logits_real": "", "logits_fake": "", "r1_penalty": "", "r1_effective_weight": "",
+                                "nll_grads_norm": "", "g_grads_norm": "",
+                                "psnr": "", "lpips": "",
+                                "psnr_ema": "", "lpips_ema": "",
+                            })
+                            csv_file.flush()
+                        except Exception:
+                            pass
+
+            # --- Auto discriminator refresh (staleness detection) ---
+            if (
+                args.disc_auto_refresh
+                and current_step >= disc.module.discriminator_iter_start
+                and len(disc_loss_buffer) >= args.disc_stale_window
+            ):
+                cooldown_ok = (
+                    last_disc_refresh_step is None
+                    or (current_step - last_disc_refresh_step) >= args.disc_auto_refresh_cooldown
+                )
+                if cooldown_ok:
+                    import statistics
+                    buf_mean = statistics.mean(disc_loss_buffer)
+                    buf_std = statistics.pstdev(disc_loss_buffer)
+                    if buf_mean > args.disc_stale_loss_threshold and buf_std < args.disc_stale_std_threshold:
+                        disc.module.discriminator.apply(weights_init)
+                        # Broadcast rank 0 weights to all ranks to keep DDP in sync
+                        for param in disc.module.discriminator.parameters():
+                            dist.broadcast(param.data, src=0)
+                        disc_optimizer = torch.optim.AdamW(
+                            filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
+                            lr=disc_lr, weight_decay=args.weight_decay,
+                        )
+                        last_disc_refresh_step = current_step
+                        disc_loss_buffer.clear()
+                        if global_rank == 0:
+                            logger.info(
+                                f"[Auto Disc Refresh] Staleness detected at step {current_step}: "
+                                f"mean={buf_mean:.4f}, std={buf_std:.4f}. "
+                                f"Warmup for {args.disc_refresh_warmup} steps."
+                            )
+                            if csv_writer is not None:
+                                try:
+                                    csv_writer.writerow({
+                                        "step": current_step,
+                                        "generator_loss": "DISC_AUTO_REFRESH",
+                                        "discriminator_loss": "", "rec_loss": "",
+                                        "perceptual_loss": "", "kl_loss": "",
+                                        "wavelet_loss": "", "logvar": "", "nll_loss": "",
+                                        "g_loss": "", "d_weight": "",
+                                        "logits_real": "", "logits_fake": "", "r1_penalty": "", "r1_effective_weight": "",
+                                        "nll_grads_norm": "", "g_grads_norm": "",
+                                        "psnr": "", "lpips": "",
+                                        "psnr_ema": "", "lpips_ema": "",
+                                    })
+                                    csv_file.flush()
+                                except Exception:
+                                    pass
+
+            # --- Select generator or discriminator step ---
+            in_disc_warmup = (
+                last_disc_refresh_step is not None
+                and (current_step - last_disc_refresh_step) < args.disc_refresh_warmup
+            )
+
+            if in_disc_warmup:
+                # Warmup: only train discriminator after refresh
+                set_modules_requires_grad(modules_to_train, False)
+                disc.module.discriminator.requires_grad_(True)
+                step_gen = False
+                step_dis = True
+            elif (
                 current_step % 2 == 1
                 and current_step >= disc.module.discriminator_iter_start
             ):
                 set_modules_requires_grad(modules_to_train, False)
+                disc.module.discriminator.requires_grad_(True)
                 step_gen = False
                 step_dis = True
             else:
                 set_modules_requires_grad(modules_to_train, True)
+                disc.module.discriminator.requires_grad_(False)
                 step_gen = True
                 step_dis = False
 
@@ -1079,8 +1297,9 @@ def train(args):
                 step_gen or step_dis
             ), "You should backward either Gen. or Dis. in a step."
 
-            # forward
-            with torch.amp.autocast('cuda', dtype=precision):
+            # forward (use no_grad for disc steps to save memory)
+            fwd_ctx = torch.no_grad() if step_dis else nullcontext()
+            with fwd_ctx, torch.amp.autocast('cuda', dtype=precision):
                 outputs = model(inputs)
                 recon = outputs.sample
                 posterior = outputs.latent_dist
@@ -1091,7 +1310,8 @@ def train(args):
             # generator loss
             if step_gen:
                 with torch.amp.autocast('cuda', dtype=precision):
-                    g_loss, g_log = disc(
+                    # Use disc.module directly to bypass DDP (no gradient sync needed for disc in gen step)
+                    g_loss, g_log = disc.module(
                         inputs,
                         recon,
                         posterior,
@@ -1103,6 +1323,8 @@ def train(args):
                     )
                 gen_optimizer.zero_grad()
                 scaler.scale(g_loss).backward()
+                scaler.unscale_(gen_optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                 scaler.step(gen_optimizer)
                 scaler.update()
 
@@ -1129,13 +1351,23 @@ def train(args):
                 ):
                     try:
                         csv_writer.writerow({
-                            "step": current_step + 1,
+                            "step": current_step,
                             "generator_loss": _to_csv_scalar(g_loss),
                             "discriminator_loss": "",
                             "rec_loss": _to_csv_scalar(g_log.get('train/rec_loss')),
                             "perceptual_loss": _to_csv_scalar(g_log.get('train/p_loss')),
                             "kl_loss": _to_csv_scalar(g_log.get('train/kl_loss')),
                             "wavelet_loss": _to_csv_scalar(g_log.get('train/wl_loss')),
+                            "logvar": _to_csv_scalar(g_log.get('train/logvar')),
+                            "nll_loss": _to_csv_scalar(g_log.get('train/nll_loss')),
+                            "g_loss": _to_csv_scalar(g_log.get('train/g_loss')),
+                            "d_weight": _to_csv_scalar(g_log.get('train/d_weight')),
+                            "logits_real": "",
+                            "logits_fake": "",
+                            "r1_penalty": "",
+                            "r1_effective_weight": "",
+                            "nll_grads_norm": _to_csv_scalar(g_log.get('train/nll_grads_norm')),
+                            "g_grads_norm": _to_csv_scalar(g_log.get('train/g_grads_norm')),
                             "psnr": "",
                             "lpips": "",
                             "psnr_ema": "",
@@ -1161,8 +1393,14 @@ def train(args):
                 disc_optimizer.zero_grad()
                 scaler.scale(d_loss).backward()
                 scaler.unscale_(disc_optimizer)
+                torch.nn.utils.clip_grad_norm_(disc.module.discriminator.parameters(), args.clip_grad_norm)
                 scaler.step(disc_optimizer)
                 scaler.update()
+                if args.disc_auto_refresh:
+                    # Use globally averaged loss so staleness detection is consistent across ranks
+                    d_loss_avg = d_loss.detach().clone()
+                    dist.all_reduce(d_loss_avg, op=dist.ReduceOp.AVG)
+                    disc_loss_buffer.append(d_loss_avg.item())
                 if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
                     wandb.log(
                         {"train/discriminator_loss": d_loss.item()}, step=current_step
@@ -1175,13 +1413,23 @@ def train(args):
                 ):
                     try:
                         csv_writer.writerow({
-                            "step": current_step + 1,
+                            "step": current_step,
                             "generator_loss": "",
                             "discriminator_loss": _to_csv_scalar(d_log.get('train/disc_loss', d_loss)),
                             "rec_loss": "",
                             "perceptual_loss": "",
                             "kl_loss": "",
                             "wavelet_loss": "",
+                            "logvar": "",
+                            "nll_loss": "",
+                            "g_loss": "",
+                            "d_weight": "",
+                            "logits_real": _to_csv_scalar(d_log.get('train/logits_real')),
+                            "logits_fake": _to_csv_scalar(d_log.get('train/logits_fake')),
+                            "r1_penalty": _to_csv_scalar(d_log.get('train/r1_penalty')),
+                            "r1_effective_weight": _to_csv_scalar(d_log.get('train/r1_effective_weight')),
+                            "nll_grads_norm": "",
+                            "g_grads_norm": "",
                             "psnr": "",
                             "lpips": "",
                             "psnr_ema": "",
@@ -1211,7 +1459,8 @@ def train(args):
                         patch_records,
                         logged_sample_indices,
                     ) = valid(
-                        global_rank, rank, model, discriminator, val_dataloader, precision, args
+                        global_rank, rank, model, discriminator, val_dataloader, precision, args,
+                        lpips_model=val_lpips_model
                     )
                     valid_psnr, valid_lpips, valid_orig_images, valid_recon_images, valid_patch_records = gather_valid_result(
                         psnr_list, lpips_list, orig_images, recon_images, patch_records, rank, dist.get_world_size()
@@ -1296,6 +1545,11 @@ def train(args):
                                 "perceptual_loss": "",
                                 "kl_loss": "",
                                 "wavelet_loss": "",
+                                "logvar": "", "nll_loss": "",
+                                "g_loss": "", "d_weight": "",
+                                "logits_real": "", "logits_fake": "",
+                                "r1_penalty": "", "r1_effective_weight": "",
+                                "nll_grads_norm": "", "g_grads_norm": "",
                                 "psnr": "",
                                 "lpips": "",
                                 "psnr_ema": "",
@@ -1338,7 +1592,7 @@ def train(args):
                 if global_rank == 0 and not args.disable_plot:
                     try:
                         plot_training_curves(
-                            csv_path=ckpt_dir / "training_losses.csv",
+                            csv_path=ckpt_dir / csv_name,
                             output_path=ckpt_dir / "training_curves.png",
                             disc_start=args.disc_start
                         )
@@ -1362,7 +1616,11 @@ def train(args):
                     ddp_sampler.state_dict(),
                     ckpt_dir,
                     f"checkpoint-{current_step}.ckpt",
-                    ema_state_dict=ema.shadow if args.ema else {},
+                    ema_state_dict=ema.shadow if args.ema else None,
+                    disc_refresh_state={
+                        "last_disc_refresh_step": last_disc_refresh_step,
+                        "disc_loss_buffer": list(disc_loss_buffer),
+                    } if args.disc_auto_refresh else None,
                 )
                 logger.info(f"Checkpoint has been saved to `{file_path}`.")
 
@@ -1391,7 +1649,7 @@ def train(args):
             try:
                 logger.info("Generating final training curves plot...")
                 plot_training_curves(
-                    csv_path=ckpt_dir / "training_losses.csv",
+                    csv_path=ckpt_dir / csv_name,
                     output_path=ckpt_dir / "training_curves_final.png",
                     disc_start=args.disc_start
                 )
@@ -1453,7 +1711,6 @@ def main():
     parser.add_argument("--wavelet_weight", type=float, default=0.1, help="weight for wavelet loss")
 
     # Discriminator Model
-    parser.add_argument("--load_disc_from_checkpoint", type=str, default=None, help="load discriminator from checkpoint")
     parser.add_argument(
         "--disc_cls",
         type=str,
@@ -1462,10 +1719,25 @@ def main():
     )
     parser.add_argument("--disc_start", type=int, default=80000, help="step to start discriminator training")
     parser.add_argument("--disc_weight", type=float, default=0.5, help="discriminator loss weight")
+    parser.add_argument("--adaptive_weight_clamp", type=float, default=1e5, help="clamp upper bound for adaptive d_weight (default 1e5, lower to reduce disc influence)")
+    parser.add_argument("--r1_weight", type=float, default=0.0, help="R1 gradient penalty weight for discriminator (0=disabled)")
+    parser.add_argument("--r1_start", type=int, default=0, help="Step to start R1 penalty (0=from beginning)")
+    parser.add_argument("--r1_warmup_steps", type=int, default=0, help="Linear warmup steps for R1 weight (0=no warmup, immediate full weight)")
+    parser.add_argument("--disc_lr", type=float, default=None, help="discriminator learning rate (default: same as --lr, TTUR recommends 2-4x)")
+    parser.add_argument("--refresh_discriminator", action="store_true", help="reinitialize discriminator weights when resuming from checkpoint")
+    parser.add_argument("--disc_refresh_every", type=int, default=0, help="periodically refresh discriminator every N steps (0=disabled)")
+    parser.add_argument("--disc_refresh_warmup", type=int, default=100, help="after refresh, train only discriminator for N steps")
+    parser.add_argument("--disc_auto_refresh", action="store_true", help="auto-refresh discriminator when disc_loss stagnates at high value")
+    parser.add_argument("--disc_stale_window", type=int, default=500, help="rolling window size (in disc steps) for staleness detection")
+    parser.add_argument("--disc_stale_loss_threshold", type=float, default=0.8, help="mean disc_loss above this is considered 'high'")
+    parser.add_argument("--disc_stale_std_threshold", type=float, default=0.02, help="std below this means loss is flat/stagnant")
+    parser.add_argument("--disc_auto_refresh_cooldown", type=int, default=5000, help="minimum training steps between auto-refreshes")
     parser.add_argument("--kl_weight", type=float, default=1e-06, help="KL divergence weight")
     parser.add_argument("--perceptual_weight", type=float, default=1.0, help="perceptual loss weight")
     parser.add_argument("--loss_type", type=str, default="l1", help="reconstruction loss type")
     parser.add_argument("--logvar_init", type=float, default=0.0, help="log variance initialization")
+    parser.add_argument("--learn_logvar", action="store_true", help="learn the log variance (balances rec loss vs GAN loss automatically)")
+    parser.add_argument("--logvar_lr", type=float, default=None, help="separate learning rate for logvar (default: same as --lr)")
     parser.add_argument("--csv_log_steps", type=int, default=50, help="log losses to CSV every N steps")
     parser.add_argument("--disable_plot", action="store_true", help="disable automatic plot generation")
     parser.add_argument("--disable_wandb", action="store_true", help="disable wandb logging")

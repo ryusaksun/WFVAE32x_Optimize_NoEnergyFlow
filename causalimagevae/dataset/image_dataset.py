@@ -59,7 +59,7 @@ class ImageDataset(data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retry=0):
         image_path = self.samples[idx]
         try:
             image = Image.open(image_path).convert("RGB")
@@ -67,7 +67,9 @@ class ImageDataset(data.Dataset):
             return dict(image=image, label="", path=image_path)
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
-            return self.__getitem__(random.randint(0, len(self) - 1))
+            if _retry >= 10:
+                raise RuntimeError(f"Failed to load image after {_retry} retries, last path: {image_path}")
+            return self.__getitem__(random.randint(0, len(self) - 1), _retry=_retry + 1)
 
 
 class ValidImageDataset(data.Dataset):
@@ -128,7 +130,7 @@ class ValidImageDataset(data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retry=0):
         image_path = self.samples[idx]
         try:
             image = Image.open(image_path).convert("RGB")
@@ -137,4 +139,7 @@ class ValidImageDataset(data.Dataset):
             return dict(image=image, file_name=file_name, index=idx)
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
-            return self.__getitem__(0)
+            if _retry >= 10:
+                raise RuntimeError(f"Failed to load validation image after {_retry} retries, last path: {image_path}")
+            next_idx = (idx + 1) % len(self) if len(self) > 1 else 0
+            return self.__getitem__(next_idx, _retry=_retry + 1)

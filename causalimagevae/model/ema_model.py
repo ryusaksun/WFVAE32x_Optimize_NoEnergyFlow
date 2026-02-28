@@ -19,8 +19,8 @@ class EMA:
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if name in self.shadow:
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name].clone()
 
     def restore(self):
         for name, param in self.model.named_parameters():
