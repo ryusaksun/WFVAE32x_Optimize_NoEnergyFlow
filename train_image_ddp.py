@@ -513,7 +513,7 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
 
             # Calculate PSNR (data range [-1, 1], so MAX=2)
             mse = torch.mean(torch.square(inputs - image_recon), dim=(1, 2, 3))
-            psnr = 20 * torch.log10(2.0 / torch.sqrt(mse))
+            psnr = 20 * torch.log10(2.0 / torch.sqrt(mse.clamp(min=1e-10)))
             psnr = psnr.mean().detach().cpu().item()
 
             # Calculate LPIPS
@@ -531,8 +531,7 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
 
             if global_rank == 0:
                 bar.update()
-            # Release gpus memory
-            torch.cuda.empty_cache()
+
     return psnr_list, lpips_list, orig_images, recon_images, patch_records, logged_sample_indices
 
 def gather_valid_result(psnr_list, lpips_list, orig_images, recon_images, patch_records, rank, world_size):
@@ -933,7 +932,7 @@ def train(args):
             raise Exception(
                 f"Make sure `{args.resume_from_checkpoint}` is a ckpt file."
             )
-        checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu")
+        checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu", weights_only=False)
         model.module.load_state_dict(checkpoint["state_dict"]["gen_model"], strict=False)
 
         # resume optimizer
@@ -955,7 +954,6 @@ def train(args):
                 filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
                 lr=disc_lr, weight_decay=args.weight_decay,
             )
-            scaler.load_state_dict(checkpoint["scaler_state"])
             logger.info("Discriminator REFRESHED at resume (weights reinitialized, optimizer reset).")
         elif not args.not_resume_discriminator:
             disc.module.load_state_dict(checkpoint["state_dict"]["dics_model"])
@@ -966,6 +964,9 @@ def train(args):
                     for pg in disc_optimizer.param_groups:
                         pg['lr'] = disc_lr
                     logger.info(f"Overriding resumed discriminator lr to {disc_lr} (TTUR)")
+
+        # M3: always restore scaler state on resume (regardless of disc resume flags)
+        if "scaler_state" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state"])
 
         # resume data sampler and training progress
@@ -1064,47 +1065,17 @@ def train(args):
             csv_writer.writeheader()
             csv_supports_ema_columns = True
 
-    # Setup signal handlers for graceful interruption
+    # Setup signal handlers for graceful interruption (flag-based, safe for NCCL)
+    _interrupted = False
+
     def signal_handler(signum, frame):
-        """Handle Ctrl+C and kill signals gracefully"""
+        """Set flag for main loop to handle; avoid calling NCCL/sys.exit in handler."""
+        nonlocal _interrupted
+        _interrupted = True
         if global_rank == 0:
-            logger.warning(f"\nReceived signal {signum}. Gracefully shutting down...")
+            logger.warning(f"\nReceived signal {signum}. Will exit at next safe point...")
 
-            # Close CSV file
-            if csv_file is not None:
-                try:
-                    csv_file.flush()
-                    csv_file.close()
-                    logger.info("CSV file closed successfully")
-                except Exception as e:
-                    logger.error(f"Error closing CSV file: {e}")
-
-            # Generate final plot with '_interrupted' suffix
-            if not args.disable_plot:
-                try:
-                    csv_path = ckpt_dir / csv_name
-                    plot_path = ckpt_dir / f"training_curves_interrupted_step{current_step}.png"
-                    logger.info(f"Generating interrupted training plot at {plot_path}")
-                    plot_training_curves(
-                        csv_path=csv_path,
-                        output_path=plot_path,
-                        disc_start=args.disc_start,
-                        smoothing_window=50
-                    )
-                except Exception as e:
-                    logger.error(f"Error generating interrupted plot: {e}")
-
-            logger.info("Shutdown complete. Exiting...")
-
-        # Cleanup distributed processes
-        try:
-            dist.destroy_process_group()
-        except:
-            pass
-
-        sys.exit(0)
-
-    # Register signal handlers on all ranks so non-rank-0 processes also exit cleanly
+    # Register signal handlers on all ranks
     signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler)  # kill command
 
@@ -1171,11 +1142,17 @@ def train(args):
             bar.update()
 
     # training Loop
-    for epoch in range(start_epoch, num_epochs):
+    try:  # M2: try/finally guarantees CSV close on any exception
+     for epoch in range(start_epoch, num_epochs):
         set_train(modules_to_train)
         ddp_sampler.set_epoch(epoch)  # Shuffle data at every epoch
 
         for batch_idx, batch in enumerate(dataloader):
+            # M1: check interrupt flag at safe point (between iterations, outside NCCL ops)
+            if _interrupted:
+                stop_training = True
+                break
+
             if args.max_steps is not None and current_step >= args.max_steps:
                 stop_training = True
                 break
@@ -1324,7 +1301,9 @@ def train(args):
                 gen_optimizer.zero_grad()
                 scaler.scale(g_loss).backward()
                 scaler.unscale_(gen_optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                # M4: clip all params in gen_optimizer (model + logvar)
+                all_gen_params = [p for pg in gen_optimizer.param_groups for p in pg["params"]]
+                torch.nn.utils.clip_grad_norm_(all_gen_params, args.clip_grad_norm)
                 scaler.step(gen_optimizer)
                 scaler.update()
 
@@ -1341,7 +1320,7 @@ def train(args):
                         {"train/rec_loss": g_log['train/rec_loss']}, step=current_step
                     )
                     wandb.log(
-                        {"train/latents_std": posterior.sample().std().item()}, step=current_step
+                        {"train/latents_std": posterior.mean.detach().std().item()}, step=current_step
                     )
 
                 # Log generator-related metrics to CSV
@@ -1587,8 +1566,10 @@ def train(args):
                 valid_model(model)
                 if args.ema:
                     ema.apply_shadow()
-                    valid_model(model, "ema")
-                    ema.restore()
+                    try:
+                        valid_model(model, "ema")
+                    finally:
+                        ema.restore()
                 if global_rank == 0 and not args.disable_plot:
                     try:
                         plot_training_curves(
@@ -1633,24 +1614,28 @@ def train(args):
         if stop_training:
             break
 
-    # end training
-    # Training completed - cleanup and final plot
-    if global_rank == 0:
-        # Close CSV file
-        if csv_file is not None:
+    finally:  # M2: guarantee CSV close on any exception / interrupt / normal exit
+        if global_rank == 0 and csv_file is not None:
             try:
+                csv_file.flush()
                 csv_file.close()
                 logger.info("CSV file closed.")
             except Exception as e:
                 logger.error(f"Failed to close CSV: {e}")
 
-        # Generate final plot
+    # end training — cleanup and final plot
+    if global_rank == 0:
+        # Generate final plot (suffix depends on whether interrupted)
         if not args.disable_plot:
             try:
-                logger.info("Generating final training curves plot...")
+                if _interrupted:
+                    plot_name = f"training_curves_interrupted_step{current_step}.png"
+                else:
+                    plot_name = "training_curves_final.png"
+                logger.info(f"Generating training curves plot: {plot_name}")
                 plot_training_curves(
                     csv_path=ckpt_dir / csv_name,
-                    output_path=ckpt_dir / "training_curves_final.png",
+                    output_path=ckpt_dir / plot_name,
                     disc_start=args.disc_start
                 )
             except Exception as e:

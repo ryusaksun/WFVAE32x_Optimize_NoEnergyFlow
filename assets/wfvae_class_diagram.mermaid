@@ -15,7 +15,7 @@ classDiagram
     class WFIVAE2Model {
         +encoder: WFIVAE2Encoder
         +decoder: WFIVAE2Decoder
-        +latent_dim: int = 8
+        +latent_dim: int = 16
         +base_channels: [128, 256, 512]
         +encode(x) AutoencoderKLOutput
         +decode(z) DecoderOutput

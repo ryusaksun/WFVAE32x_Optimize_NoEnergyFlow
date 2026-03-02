@@ -32,12 +32,16 @@ class ManifestImageDataset(Dataset):
         self.base_dir = base_dir or os.path.dirname(manifest_path)
         self.resolution = resolution
 
-        # Load manifest
+        # Load manifest (M8: tolerate malformed lines)
         self.samples = []
         with open(manifest_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
+            for line_num, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
                     self.samples.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"Warning: skipping malformed line {line_num} in {manifest_path}: {e}")
 
         print(f"Loaded {len(self.samples)} samples from {manifest_path}")
 
@@ -55,8 +59,10 @@ class ManifestImageDataset(Dataset):
     def __getitem__(self, idx, _retry=0):
         sample = self.samples[idx]
 
-        # Get image path - support multiple field names
+        # Get image path - support multiple field names (M9: error on missing field)
         image_path = sample.get('image_path', sample.get('path', sample.get('target', '')))
+        if not image_path:
+            raise KeyError(f"Sample at index {idx} has no 'image_path', 'path', or 'target' field: {sample}")
         if not os.path.isabs(image_path):
             image_path = os.path.join(self.base_dir, image_path)
 
@@ -94,12 +100,16 @@ class ValidManifestImageDataset(Dataset):
         self.base_dir = base_dir or os.path.dirname(manifest_path)
         self.resolution = resolution
 
-        # Load manifest
+        # Load manifest (M8: tolerate malformed lines)
         self.samples = []
         with open(manifest_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
+            for line_num, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
                     self.samples.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"Warning: skipping malformed line {line_num} in {manifest_path}: {e}")
 
         print(f"Loaded {len(self.samples)} validation samples from {manifest_path}")
 
@@ -125,8 +135,10 @@ class ValidManifestImageDataset(Dataset):
     def __getitem__(self, idx, _retry=0):
         sample = self.samples[idx]
 
-        # Get image path - support multiple field names
+        # Get image path - support multiple field names (M9: error on missing field)
         image_path = sample.get('image_path', sample.get('path', sample.get('target', '')))
+        if not image_path:
+            raise KeyError(f"Validation sample at index {idx} has no 'image_path', 'path', or 'target' field: {sample}")
         if not os.path.isabs(image_path):
             image_path = os.path.join(self.base_dir, image_path)
 

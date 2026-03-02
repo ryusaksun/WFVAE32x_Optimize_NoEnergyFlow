@@ -44,14 +44,14 @@ flowchart TB
         end
 
         subgraph E_STEP6["Step 6: To Latent"]
-            E6["GroupNorm → SiLU → Conv(512→16)"]:::conv
+            E6["GroupNorm → SiLU → Conv(512→32)"]:::conv
         end
     end
 
     %% ==================== LATENT ====================
     subgraph LATENT["━━━━━━ LATENT SPACE ━━━━━━"]
-        L1["Split channels: 16 → 8 + 8<br/>━━━━━━━━━━<br/>mean (μ) | log_var (σ²)"]:::latent
-        L2(["Sample: z = μ + σ · ε<br/>Shape: (B, 8, H/8, W/8)"]):::latent
+        L1["Split channels: 32 → 16 + 16<br/>━━━━━━━━━━<br/>mean (μ) | log_var (σ²)"]:::latent
+        L2(["Sample: z = μ + σ · ε<br/>Shape: (B, 16, H/8, W/8)"]):::latent
     end
 
     %% ==================== DECODER ====================
@@ -59,7 +59,7 @@ flowchart TB
         direction TB
 
         subgraph D_STEP1["Step 1: From Latent"]
-            D1["Conv2d(8 → 512)"]:::conv
+            D1["Conv2d(16 → 512)"]:::conv
         end
 
         subgraph D_STEP2["Step 2: Mid Block"]

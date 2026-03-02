@@ -91,7 +91,11 @@ generator_loss = rec_loss/exp(logvar) + logvar + perceptual_loss + kl_loss + dis
 ```
 where `disc_loss = -mean(D(recon)) * adaptive_weight * disc_factor` and `wavelet_loss = l1(encoder_coeffs, decoder_coeffs_reversed)`.
 
-**Discriminator refresh**: If the discriminator collapses (disc_loss stuck at 1.0), it can be reinitialized via `--refresh_discriminator` (at resume) or `--disc_refresh_every N` (periodic). After refresh, a warmup period (`--disc_refresh_warmup`, default 100 steps) trains only the discriminator before resuming alternating optimization.
+**Discriminator refresh**: If the discriminator collapses (disc_loss stuck at 1.0), it can be reinitialized via `--refresh_discriminator` (at resume) or `--disc_refresh_every N` (periodic). After refresh, a warmup period (`--disc_refresh_warmup`, default 100 steps) trains only the discriminator before resuming alternating optimization. Auto-refresh (`--disc_auto_refresh`) monitors a rolling window and triggers refresh when disc_loss mean > threshold with low std (stale detection).
+
+**TTUR**: Discriminator can use a separate learning rate (`--disc_lr`, default same as generator). Two Time-scale Update Rule recommends 2-4× the generator LR for faster discriminator convergence.
+
+**Learned logvar** (`--learn_logvar`): When enabled, `logvar` becomes a trainable scalar with its own optimizer (lr controlled by `--logvar_lr`, default 1e-2), auto-balancing reconstruction loss vs GAN loss magnitude.
 
 Mixed precision: default bfloat16 (`--mix_precision bf16`), also supports `fp16` and `fp32`. Uses `torch.amp.GradScaler`.
 
@@ -129,7 +133,7 @@ model = model_cls.from_config("examples/wfivae2-image-1024.json")
 | Parameter | Value |
 |-----------|-------|
 | `--model_name` | WFIVAE2 |
-| `--model_config` | wfivae2-image-1024.json |
+| `--model_config` | wfivae2-image-16chn.json (default), wfivae2-image-1024.json (8chn legacy) |
 | `--disc_cls` | causalimagevae.model.losses.LPIPSWithDiscriminator |
 | `--disc_start` | 5 (this repo), 80000 (default) |
 | `--kl_weight` | 1e-6 |
@@ -164,11 +168,13 @@ Under `{ckpt_dir}/{exp_name-lr...-bs...-rs...}/`:
 ## Model Configs
 
 Located in `examples/`:
-- `wfivae2-image-1024.json` — 1024px, latent_dim=8, base_channels=[128,256,512]
+- `wfivae2-image-16chn.json` — latent_dim=16, base_channels=[128,256,512] (default, aligned with official WF-VAE)
+- `wfivae2-image-1024.json` — latent_dim=8, base_channels=[128,256,512] (legacy)
 
 ### Latent Dimensions
-- 1024px input → latent shape `[B, 8, 128, 128]`
-- 512px input → latent shape `[B, 8, 64, 64]`
+- 1024px input → latent shape `[B, 16, 128, 128]`
+- 512px input → latent shape `[B, 16, 64, 64]`
+- 256px input → latent shape `[B, 16, 32, 32]`
 - Spatial compression: 8× (2× wavelet + 4× from 2 downsampling blocks)
 
 ## Data Format
@@ -183,23 +189,36 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GPU` | `0` | GPU indices, e.g. `0,1,2,3` for multi-GPU DDP |
+| `GPU` | `6` (check script) | GPU indices, e.g. `0,1,2,3` for multi-GPU DDP |
 | `RESOLUTION` | `256` | Image resolution (256, 512, or 1024) |
-| `BATCH_SIZE` | `16` (256px) / `2` (1024px) | Per-GPU batch size |
+| `BATCH_SIZE` | `16` (256px) / `8` (512px) / `2` (1024px) | Per-GPU batch size |
 | `EPOCHS` | `1000` | Training epochs |
 | `EVAL_STEPS` | `1000` | Validation interval |
 | `SAVE_CKPT_STEP` | `2000` | Checkpoint save interval |
 | `EVAL_SUBSET_SIZE` | `30` | Validation subset (0 = full set) |
+| `EVAL_NUM_IMAGE_LOG` | `20` | Number of val images to save & visualize |
+| `CSV_LOG_STEPS` | `50` | CSV logging frequency |
+| `LOG_STEPS` | `10` | Console logging frequency |
+| `DATASET_NUM_WORKER` | `8` | DataLoader workers |
 | `RESUME_CKPT` | — | Path to checkpoint for resumption |
 | `REFRESH_DISC` | — | Non-empty to reinitialize discriminator at resume |
 | `DISC_REFRESH_EVERY` | `0` | Periodic discriminator refresh interval (0=disabled) |
 | `DISC_REFRESH_WARMUP` | `100` | Disc-only training steps after each refresh |
-| `ORIGINAL_MANIFEST` | `./ssk_image_manifest.jsonl` | JSONL manifest path |
+| `DISC_LR` | `1e-5` | Discriminator learning rate (TTUR: set 2-4× gen LR) |
+| `DISC_AUTO_REFRESH` | — | Non-empty to enable auto-refresh on stale detection |
+| `DISC_STALE_WINDOW` | `500` | Rolling window size for stale detection |
+| `DISC_STALE_LOSS` | `0.8` | disc_loss mean threshold for staleness |
+| `DISC_STALE_STD` | `0.02` | disc_loss std threshold for staleness |
+| `DISC_AUTO_COOLDOWN` | `5000` | Cooldown steps between auto-refreshes |
+| `LEARN_LOGVAR` | — | Non-empty to enable learned logvar |
+| `LOGVAR_LR` | `1e-2` | Learning rate for logvar parameter |
+| `ORIGINAL_MANIFEST` | `/mnt/sdb/kinetics400_frames/train_manifest.jsonl` | Training JSONL manifest path |
+| `VAL_MANIFEST` | `/mnt/sdb/kinetics400_frames/val_manifest.jsonl` | Pre-split validation manifest (skips auto-split) |
 | `OUTPUT_DIR` | `/mnt/sdb/{project_name}` | Output directory |
 | `DISABLE_WANDB` | `1` | `1`/`true`/`yes` to disable WandB |
-| `TRAIN_RATIO` | `0.9` | Train/val split ratio |
+| `TRAIN_RATIO` | `0.9` | Train/val split ratio (only when no VAL_MANIFEST) |
 | `MIX_PRECISION` | `bf16` | Training precision: `bf16`, `fp16`, or `fp32` |
-| `ADAPTIVE_WEIGHT_CLAMP` | `1e5` | Max adaptive weight for discriminator |
+| `ADAPTIVE_WEIGHT_CLAMP` | `1e6` | Max adaptive weight for discriminator |
 | `R1_WEIGHT` | `0` | R1 gradient penalty weight (0=disabled) |
 | `R1_START` | `0` | Step to begin R1 penalty |
 | `R1_WARMUP_STEPS` | `0` | Linear warmup steps for R1 (0=instant) |

@@ -24,7 +24,7 @@ class LPIPS(nn.Module):
 
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(name, ".cache/lpips")
-        self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu")), strict=False)
+        self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"), weights_only=False), strict=False)
         print("loaded pretrained LPIPS loss from {}".format(ckpt))
 
     @classmethod
@@ -33,7 +33,7 @@ class LPIPS(nn.Module):
             raise NotImplementedError
         model = cls()
         ckpt = get_ckpt_path(name)
-        model.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu")), strict=False)
+        model.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"), weights_only=False), strict=False)
         return model
 
     def forward(self, input, target):

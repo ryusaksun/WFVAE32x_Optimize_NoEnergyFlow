@@ -100,7 +100,7 @@ class WFUpBlock(nn.Module):
 
         coeffs = self.out_flow_conv(x[:, -self.energy_flow_size:])
         if w is not None:
-            coeffs[:, :3] = coeffs[:, :3] + w
+            coeffs = torch.cat([coeffs[:, :3] + w, coeffs[:, 3:]], dim=1)
         w = self.inverse_wavelet_transform(coeffs)
 
         x = self.res_block(x[:, :-self.energy_flow_size])
@@ -114,7 +114,7 @@ class Encoder(VideoBaseAE):
     @register_to_config
     def __init__(
         self,
-        latent_dim: int = 8,
+        latent_dim: int = 16,
         num_resblocks: int = 2,
         energy_flow_size: int = 64,
         dropout: float = 0.0,
@@ -181,7 +181,7 @@ class Decoder(VideoBaseAE):
     @register_to_config
     def __init__(
         self,
-        latent_dim: int = 8,
+        latent_dim: int = 16,
         num_resblocks: int = 2,
         dropout: float = 0.0,
         energy_flow_size: int = 128,
@@ -241,7 +241,7 @@ class Decoder(VideoBaseAE):
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
-        h[:, :3] = h[:, :3] + w
+        h = torch.cat([h[:, :3] + w, h[:, 3:]], dim=1)
         dec = self.inverse_wavelet_transform_out(h)
         return dec, inter_coeffs
 
@@ -253,7 +253,7 @@ class WFIVAE2Model(VideoBaseAE):
     @register_to_config
     def __init__(
         self,
-        latent_dim: int = 4,
+        latent_dim: int = 16,
         base_channels: List[int] = [128, 256, 512],
         decoder_base_channels: Optional[List[int]] = None,
         encoder_num_resblocks: int = 2,
@@ -263,8 +263,8 @@ class WFIVAE2Model(VideoBaseAE):
         dropout: float = 0.0,
         norm_type: str = "layernorm",
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
-        scale: List[float] = [0.18215, 0.18215, 0.18215, 0.18215, 0.18215, 0.18215, 0.18215, 0.18215],
-        shift: List[float] = [0, 0, 0, 0, 0, 0, 0, 0],
+        scale: List[float] = [0.18215] * 16,
+        shift: List[float] = [0] * 16,
     ) -> None:
         super().__init__()
         self.use_tiling = False
@@ -334,8 +334,10 @@ class WFIVAE2Model(VideoBaseAE):
         else:
             return self.decoder.conv_out.weight
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")
+    def init_from_ckpt(self, path, ignore_keys=None):
+        if ignore_keys is None:
+            ignore_keys = []
+        sd = torch.load(path, map_location="cpu", weights_only=False)
         print("init from " + path)
 
         if (

@@ -101,15 +101,25 @@ fi
 # 原始数据清单文件（JSONL格式，支持 image_path/path/target 字段）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_NAME="$(basename "$SCRIPT_DIR")"
-DEFAULT_MANIFEST="${SCRIPT_DIR}/ssk_image_manifest.jsonl"
+DEFAULT_MANIFEST="/mnt/sdb/kinetics400_frames/train_manifest.jsonl"
 ORIGINAL_MANIFEST="${ORIGINAL_MANIFEST:-$DEFAULT_MANIFEST}"
 
-# 输出目录 (默认放在 /mnt/sdc 下，包含项目名以区分实验)
+# 验证集清单（如果已预先划分好，直接指定即可跳过自动划分）
+VAL_MANIFEST="${VAL_MANIFEST:-/mnt/sdb/kinetics400_frames/val_manifest.jsonl}"
+
+# 输出目录 (默认放在 /mnt/sdb 下，包含项目名以区分实验)
 OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdb/${PROJECT_NAME}}"
 
-# 临时划分文件路径 (放在输出目录下)
-TRAIN_MANIFEST="${OUTPUT_DIR}/train_manifest.jsonl"
-EVAL_MANIFEST="${OUTPUT_DIR}/eval_manifest.jsonl"
+# 训练/验证 manifest 路径（预划分模式直接使用用户提供的文件）
+if [ -n "$VAL_MANIFEST" ]; then
+    TRAIN_MANIFEST="$ORIGINAL_MANIFEST"
+    EVAL_MANIFEST="$VAL_MANIFEST"
+    PRE_SPLIT=1
+else
+    TRAIN_MANIFEST="${OUTPUT_DIR}/train_manifest.jsonl"
+    EVAL_MANIFEST="${OUTPUT_DIR}/eval_manifest.jsonl"
+    PRE_SPLIT=0
+fi
 
 # 分辨率配置 (默认 1024)
 RESOLUTION="${RESOLUTION:-256}"
@@ -126,18 +136,18 @@ DATASET_NUM_WORKER="${DATASET_NUM_WORKER:-8}"
 
 # 根据分辨率选择默认配置 (EXP_NAME 包含 disc5 标识)
 if [ "$RESOLUTION" = "1024" ]; then
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-1024.json"
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-16chn.json"
     DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-2}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
 elif [ "$RESOLUTION" = "256" ]; then
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-1024.json"
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-16chn.json"
     DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-16}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 else
     # 512 或其他分辨率，模型配置通用（无分辨率参数）
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-1024.json"
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-16chn.json"
     DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-8}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
@@ -157,18 +167,18 @@ REFRESH_DISC="${REFRESH_DISC:-}"                   # 非空则恢复时刷新判
 DISC_REFRESH_EVERY="${DISC_REFRESH_EVERY:-0}"      # 每N步刷新判别器（0=禁用）
 DISC_REFRESH_WARMUP="${DISC_REFRESH_WARMUP:-100}"  # 刷新后判别器独占训练步数
 
-# 判别器学习率 (TTUR: Two Time-scale Update Rule)
-DISC_LR="${DISC_LR:-4e-5}"                             # 判别器学习率，默认4倍于生成器(1e-5)
+# 判别器学习率（默认与生成器一致；TTUR 建议设为 2-4 倍）
+DISC_LR="${DISC_LR:-1e-5}"                             # 判别器学习率，默认与生成器一致(1e-5)
 
 # 自适应权重 clamp 上限（控制判别器对生成器的最大影响力）
 # 默认 1e6（原始值），降低可减少判别器过强导致的伪影
-ADAPTIVE_WEIGHT_CLAMP="${ADAPTIVE_WEIGHT_CLAMP:-1e5}"
+ADAPTIVE_WEIGHT_CLAMP="${ADAPTIVE_WEIGHT_CLAMP:-1e6}"
 
 # 训练精度（bf16/fp16/fp32，fp32 对判别器更稳定但速度慢 40-60%）
-MIX_PRECISION="${MIX_PRECISION:-fp32}"
+MIX_PRECISION="${MIX_PRECISION:-bf16}"
 
 # 学习 logvar（自动平衡重建损失与 GAN 损失的量级）
-LEARN_LOGVAR="${LEARN_LOGVAR:-1}"                        # 非空启用，置空禁用
+LEARN_LOGVAR="${LEARN_LOGVAR:-}"                         # 非空启用，默认关闭
 LOGVAR_LR="${LOGVAR_LR:-1e-2}"                            # logvar 独立学习率（快速找到均衡点）
 
 # R1 梯度惩罚（防止判别器过拟合，0=禁用）
@@ -248,6 +258,11 @@ EOF
 # ============================================
 
 cleanup() {
+    # 预划分模式不清理用户提供的文件
+    if [ "$PRE_SPLIT" = "1" ]; then
+        return
+    fi
+
     echo ""
     echo "================================================"
     echo "清理临时数据集划分文件..."
@@ -277,12 +292,17 @@ trap cleanup EXIT
 echo "================================================"
 echo "WFIVAE2 Training (WF-VAE with Energy Flow)"
 echo "================================================"
-echo "原始数据集: $ORIGINAL_MANIFEST"
+if [ "$PRE_SPLIT" = "1" ]; then
+    echo "训练集: $TRAIN_MANIFEST"
+    echo "验证集: $EVAL_MANIFEST"
+else
+    echo "原始数据集: $ORIGINAL_MANIFEST"
+    echo "训练集比例: $TRAIN_RATIO"
+fi
 echo "输出目录: $OUTPUT_DIR"
 echo "模型配置: $MODEL_CONFIG"
 echo "实验名称: $EXP_NAME"
 echo "分辨率: ${RESOLUTION}x${RESOLUTION}"
-echo "训练集比例: $TRAIN_RATIO"
 echo "GPU: $GPU ($NUM_GPUS 卡)"
 echo "训练 Epochs: $EPOCHS"
 echo "Checkpoint间隔: $SAVE_CKPT_STEP"
@@ -339,9 +359,14 @@ fi
 # ============================================
 
 if [ ! -f "$ORIGINAL_MANIFEST" ]; then
-    echo "Error: 原始数据清单文件不存在: $ORIGINAL_MANIFEST"
+    echo "Error: 训练集清单文件不存在: $ORIGINAL_MANIFEST"
     echo "请设置 ORIGINAL_MANIFEST 环境变量为你的数据清单路径"
     echo "例如: ORIGINAL_MANIFEST=/path/to/manifest.jsonl bash train_wfivae.sh"
+    exit 1
+fi
+
+if [ "$PRE_SPLIT" = "1" ] && [ ! -f "$VAL_MANIFEST" ]; then
+    echo "Error: 验证集清单文件不存在: $VAL_MANIFEST"
     exit 1
 fi
 
@@ -351,10 +376,16 @@ if [ ! -f "$MODEL_CONFIG" ]; then
 fi
 
 # ============================================
-# 执行数据集划分
+# 执行数据集划分（预划分模式跳过）
 # ============================================
 
-split_dataset
+if [ "$PRE_SPLIT" = "1" ]; then
+    echo "使用预划分数据集，跳过自动划分"
+    echo "  训练集: $TRAIN_MANIFEST"
+    echo "  验证集: $EVAL_MANIFEST"
+else
+    split_dataset
+fi
 
 # ============================================
 # 开始训练
@@ -369,64 +400,66 @@ LOG_FILE="${OUTPUT_DIR}/training_wfivae_${RESOLUTION}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # 构建resume参数
-RESUME_ARGS=""
+RESUME_ARGS=()
 if [ -n "$RESUME_CKPT" ]; then
-    RESUME_ARGS="--resume_from_checkpoint $RESUME_CKPT"
+    RESUME_ARGS=(--resume_from_checkpoint "$RESUME_CKPT")
 fi
 
-# 训练参数
-TRAIN_ARGS="train_image_ddp.py \
-    --exp_name $EXP_NAME \
-    --image_path $TRAIN_MANIFEST \
-    --eval_image_path $EVAL_MANIFEST \
-    --use_manifest \
-    --model_name WFIVAE2 \
-    --model_config $MODEL_CONFIG \
-    --ckpt_dir $OUTPUT_DIR \
-    --resolution $RESOLUTION \
-    --batch_size $BATCH_SIZE \
-    --lr 1e-5 \
-    --weight_decay 1e-4 \
-    --epochs $EPOCHS \
-    --save_ckpt_step $SAVE_CKPT_STEP \
-    --eval_steps $EVAL_STEPS \
-    --eval_resolution $RESOLUTION \
-    --eval_batch_size $EVAL_BATCH_SIZE \
-    --eval_subset_size $EVAL_SUBSET_SIZE \
-    --eval_num_image_log $EVAL_NUM_IMAGE_LOG \
-    --eval_lpips \
-    --mix_precision $MIX_PRECISION \
-    --disc_cls causalimagevae.model.losses.LPIPSWithDiscriminator \
-    --disc_start 5 \
-    --disc_weight 0.5 \
-    --disc_lr $DISC_LR \
-    --adaptive_weight_clamp $ADAPTIVE_WEIGHT_CLAMP \
-    --r1_weight $R1_WEIGHT \
-    --r1_start $R1_START \
-    --r1_warmup_steps $R1_WARMUP_STEPS \
-    --kl_weight 1e-6 \
-    --perceptual_weight 1.0 \
-    --loss_type l1 \
-    --wavelet_loss \
-    --wavelet_weight 0.1 \
-    --ema \
-    --ema_decay 0.999 \
-    --csv_log_steps $CSV_LOG_STEPS \
-    --log_steps $LOG_STEPS \
-    --dataset_num_worker $DATASET_NUM_WORKER \
-    $WANDB_ARGS \
-    --find_unused_parameters \
-    --disc_refresh_every $DISC_REFRESH_EVERY \
-    --disc_refresh_warmup $DISC_REFRESH_WARMUP \
-    ${REFRESH_DISC:+--refresh_discriminator} \
-    ${LEARN_LOGVAR:+--learn_logvar} \
-    --logvar_lr $LOGVAR_LR \
-    ${DISC_AUTO_REFRESH:+--disc_auto_refresh} \
-    --disc_stale_window $DISC_STALE_WINDOW \
-    --disc_stale_loss_threshold $DISC_STALE_LOSS \
-    --disc_stale_std_threshold $DISC_STALE_STD \
-    --disc_auto_refresh_cooldown $DISC_AUTO_COOLDOWN \
-    $RESUME_ARGS"
+# 训练参数 (使用数组，安全处理含空格的路径)
+TRAIN_ARGS=(
+    train_image_ddp.py
+    --exp_name "$EXP_NAME"
+    --image_path "$TRAIN_MANIFEST"
+    --eval_image_path "$EVAL_MANIFEST"
+    --use_manifest
+    --model_name WFIVAE2
+    --model_config "$MODEL_CONFIG"
+    --ckpt_dir "$OUTPUT_DIR"
+    --resolution "$RESOLUTION"
+    --batch_size "$BATCH_SIZE"
+    --lr 1e-5
+    --weight_decay 1e-4
+    --epochs "$EPOCHS"
+    --save_ckpt_step "$SAVE_CKPT_STEP"
+    --eval_steps "$EVAL_STEPS"
+    --eval_resolution "$RESOLUTION"
+    --eval_batch_size "$EVAL_BATCH_SIZE"
+    --eval_subset_size "$EVAL_SUBSET_SIZE"
+    --eval_num_image_log "$EVAL_NUM_IMAGE_LOG"
+    --eval_lpips
+    --mix_precision "$MIX_PRECISION"
+    --disc_cls causalimagevae.model.losses.LPIPSWithDiscriminator
+    --disc_start 5
+    --disc_weight 0.5
+    --disc_lr "$DISC_LR"
+    --adaptive_weight_clamp "$ADAPTIVE_WEIGHT_CLAMP"
+    --r1_weight "$R1_WEIGHT"
+    --r1_start "$R1_START"
+    --r1_warmup_steps "$R1_WARMUP_STEPS"
+    --kl_weight 1e-6
+    --perceptual_weight 1.0
+    --loss_type l1
+    --wavelet_loss
+    --wavelet_weight 0.1
+    --ema
+    --ema_decay 0.999
+    --csv_log_steps "$CSV_LOG_STEPS"
+    --log_steps "$LOG_STEPS"
+    --dataset_num_worker "$DATASET_NUM_WORKER"
+    $WANDB_ARGS
+    --find_unused_parameters
+    --disc_refresh_every "$DISC_REFRESH_EVERY"
+    --disc_refresh_warmup "$DISC_REFRESH_WARMUP"
+    ${REFRESH_DISC:+--refresh_discriminator}
+    ${LEARN_LOGVAR:+--learn_logvar}
+    --logvar_lr "$LOGVAR_LR"
+    ${DISC_AUTO_REFRESH:+--disc_auto_refresh}
+    --disc_stale_window "$DISC_STALE_WINDOW"
+    --disc_stale_loss_threshold "$DISC_STALE_LOSS"
+    --disc_stale_std_threshold "$DISC_STALE_STD"
+    --disc_auto_refresh_cooldown "$DISC_AUTO_COOLDOWN"
+    "${RESUME_ARGS[@]}"
+)
 
 # 选择可用端口 (29500-29599)
 if [ -z "$MASTER_PORT" ]; then
@@ -443,10 +476,10 @@ echo "使用 torchrun 启动训练 (${NUM_GPUS} GPUs, port: ${MASTER_PORT})..."
 # 始终使用 torchrun（train_image_ddp.py 需要 DDP 环境）
 stdbuf -oL torchrun \
     --nnodes=1 \
-    --nproc_per_node=$NUM_GPUS \
+    --nproc_per_node="$NUM_GPUS" \
     --master_addr=localhost \
-    --master_port=$MASTER_PORT \
-    $TRAIN_ARGS
+    --master_port="$MASTER_PORT" \
+    "${TRAIN_ARGS[@]}"
 
 echo ""
 echo "================================================"

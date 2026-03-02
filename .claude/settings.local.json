@@ -24,7 +24,9 @@
       "WebFetch(domain:github.com)",
       "Bash(gawk NR>1 && $18!=\"\" {step=$1; psnr=$18; lpips=$19} END {print \"non-EMA: step=\"step, \"PSNR=\"psnr, \"LPIPS=\"lpips}:*)",
       "Bash(echo exit: $?:*)",
-      "Bash(git status:*)"
+      "Bash(git status:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)"
     ]
   }
 }

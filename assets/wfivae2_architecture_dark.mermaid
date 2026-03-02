@@ -36,19 +36,19 @@ flowchart LR
 
             E7["Mid Block\n-----------------------\nResnetBlock2D\nAttention2DFix (self-attn)\nResnetBlock2D\n-----------------------\nShape: (B, 512, H/8, W/8)"]:::attn
 
-            E8["Conv2d(512, 16, k=3, p=1)\n-----------------------\nInput: (B, 512, H/8, W/8)\nOp: to latent params\nOutput: (B, 16, H/8, W/8)\n-----------------------\n16 = 8(mu) + 8(logvar)"]:::backbone
+            E8["Conv2d(512, 32, k=3, p=1)\n-----------------------\nInput: (B, 512, H/8, W/8)\nOp: to latent params\nOutput: (B, 32, H/8, W/8)\n-----------------------\n32 = 16(mu) + 16(logvar)"]:::backbone
         end
 
         subgraph LAT["LATENT SPACE"]
             direction TB
-            L1["DiagonalGaussianDistribution\n-----------------------\nSplit: 16 -> 8 + 8\nmu: (B, 8, H/8, W/8)\nlogvar: (B, 8, H/8, W/8)"]:::latent
+            L1["DiagonalGaussianDistribution\n-----------------------\nSplit: 32 -> 16 + 16\nmu: (B, 16, H/8, W/8)\nlogvar: (B, 16, H/8, W/8)"]:::latent
 
-            L2["Reparameterization\n-----------------------\nz = mu + sigma * epsilon\nepsilon ~ N(0, 1)\n-----------------------\nOutput: z (B, 8, H/8, W/8)"]:::latent
+            L2["Reparameterization\n-----------------------\nz = mu + sigma * epsilon\nepsilon ~ N(0, 1)\n-----------------------\nOutput: z (B, 16, H/8, W/8)"]:::latent
         end
 
         subgraph DEC["DECODER"]
             direction TB
-            D1["Conv2d(8, 512, k=3, p=1)\n-----------------------\nInput: z (B, 8, H/8, W/8)\nOp: channel expansion\nOutput: (B, 512, H/8, W/8)"]:::backbone
+            D1["Conv2d(16, 512, k=3, p=1)\n-----------------------\nInput: z (B, 16, H/8, W/8)\nOp: channel expansion\nOutput: (B, 512, H/8, W/8)"]:::backbone
 
             D2["Mid Block\n-----------------------\nResnetBlock2D\nAttention2DFix (self-attn)\nResnetBlock2D\n-----------------------\nShape: (B, 512, H/8, W/8)"]:::attn
 

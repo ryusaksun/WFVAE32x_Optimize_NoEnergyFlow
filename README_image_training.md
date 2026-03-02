@@ -6,7 +6,7 @@
 
 - 推荐入口：`train_wfivae.sh`
 - 底层训练器：`train_image_ddp.py`
-- 模型配置：`examples/wfivae2-image-1024.json`
+- 模型配置：`examples/wfivae2-image-16chn.json`（默认 16 通道），`examples/wfivae2-image-1024.json`（8 通道 legacy）
 - 图像模型代码：`causalimagevae/`
 
 注意：仓库当前没有 `train_image_ddp.sh`，也没有 `examples/wfivae2-image.json`。
@@ -134,7 +134,7 @@ torchrun --nproc_per_node=8 train_image_ddp.py \
   --eval_image_path /path/to/eval_manifest.jsonl \
   --use_manifest \
   --model_name WFIVAE2 \
-  --model_config examples/wfivae2-image-1024.json \
+  --model_config examples/wfivae2-image-16chn.json \
   --ckpt_dir /path/to/output \
   --resolution 1024 \
   --batch_size 2 \

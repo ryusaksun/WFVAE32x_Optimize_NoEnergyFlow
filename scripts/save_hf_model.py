@@ -1,7 +1,8 @@
 import sys
+import os
 import argparse
 from pathlib import Path
-sys.path.append(".")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from causalimagevae.model import *
 
 def main():

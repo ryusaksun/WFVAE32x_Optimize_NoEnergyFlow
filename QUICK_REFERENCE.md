@@ -32,7 +32,7 @@ bash train_wfivae.sh
 ## 3) 关键事实
 
 - 主训练脚本是 `train_wfivae.sh`（不是 `train_image_ddp.sh`）
-- 主配置文件是 `examples/wfivae2-image-1024.json`
+- 主配置文件是 `examples/wfivae2-image-16chn.json`
 - `EVAL_SUBSET_SIZE<=0` 表示验证全量
 - `MAX_STEPS` 在当前版本会真实停训
 

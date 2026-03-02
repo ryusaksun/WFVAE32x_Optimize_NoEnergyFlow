@@ -67,7 +67,7 @@ class ImageDataset(data.Dataset):
             return dict(image=image, label="", path=image_path)
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
-            if _retry >= 10:
+            if _retry >= 10 or len(self) <= 1:
                 raise RuntimeError(f"Failed to load image after {_retry} retries, last path: {image_path}")
             return self.__getitem__(random.randint(0, len(self) - 1), _retry=_retry + 1)
 

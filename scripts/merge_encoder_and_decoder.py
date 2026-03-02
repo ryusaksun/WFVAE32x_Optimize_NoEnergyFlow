@@ -4,8 +4,8 @@ encoder = ""
 decoder = ""
 output = ""
 
-encoder_ckpt = torch.load(encoder, map_location="cpu")
-decoder_ckpt = torch.load(decoder, map_location="cpu")
+encoder_ckpt = torch.load(encoder, map_location="cpu", weights_only=False)
+decoder_ckpt = torch.load(decoder, map_location="cpu", weights_only=False)
 
 new_ckpt = encoder_ckpt
 # print(encoder_ckpt.keys())

@@ -33,17 +33,17 @@ flowchart TD
 
         norm_enc("GroupNorm")
         act_enc{"SiLU"}
-        conv_out_enc["Conv2d<br/>512 → 16"]
+        conv_out_enc["Conv2d<br/>512 → 32"]
     end
 
     subgraph Latent["Latent Space"]
         gaussian["DiagonalGaussianDistribution<br/>Split → μ, log(σ²)"]
         sample(("Sample z<br/>μ + σε"))
-        latent_z(["Latent z<br/>(B, 8, H/8, W/8)"])
+        latent_z(["Latent z<br/>(B, 16, H/8, W/8)"])
     end
 
     subgraph Decoder["Decoder"]
-        conv_in_dec["Conv2d<br/>8 → 512"]
+        conv_in_dec["Conv2d<br/>16 → 512"]
 
         subgraph MidDec["Mid Layers"]
             mid_res1_dec["ResnetBlock2D"]
