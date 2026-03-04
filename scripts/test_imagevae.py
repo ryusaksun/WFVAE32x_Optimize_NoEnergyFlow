@@ -16,8 +16,8 @@ WFIVAE2 图像VAE 单元测试脚本
     - WFDownBlock × 2: concat能量流融合
     - WFUpBlock × 2: outflow能量流重建
     - 8x空间压缩: 小波2x × 下采样4x (2个DownBlock)
-    - 1024: latent [B, 16, 128, 128]
-    - 512: latent [B, 16, 64, 64]
+    - 1024: latent [B, 32, 128, 128]
+    - 512: latent [B, 32, 64, 64]
 
 使用方法:
     python scripts/test_imagevae.py
@@ -41,8 +41,8 @@ def test_model_creation():
     print("=" * 60)
 
     model = WFIVAE2Model(
-        latent_dim=16,
-        base_channels=[128, 256, 512],  # 2个下采样块
+        latent_dim=32,
+        base_channels=[192, 384, 768],  # 2个下采样块
         encoder_num_resblocks=2,
         encoder_energy_flow_size=128,
         decoder_num_resblocks=3,
@@ -88,8 +88,8 @@ def test_forward_pass_512(model):
     # 512 -> 256 (小波) -> 128 (down1) -> 64 (down2)
     expected_latent_size = 512 // 8  # = 64
     assert out.sample.shape == x.shape, f"输出形状不匹配! 预期 {x.shape}, 得到 {out.sample.shape}"
-    assert out.latent_dist.mean.shape == (1, 16, expected_latent_size, expected_latent_size), \
-        f"潜在形状错误: {out.latent_dist.mean.shape}, 预期 (1, 16, {expected_latent_size}, {expected_latent_size})"
+    assert out.latent_dist.mean.shape == (1, 32, expected_latent_size, expected_latent_size), \
+        f"潜在形状错误: {out.latent_dist.mean.shape}, 预期 (1, 32, {expected_latent_size}, {expected_latent_size})"
 
     # 验证 extra_output (enc_coeffs, dec_coeffs)
     assert out.extra_output is not None, "WFIVAE2应有extra_output用于小波损失"
@@ -123,8 +123,8 @@ def test_forward_pass_1024(model):
     # 验证形状 (8x压缩: 1024 -> 128)
     expected_latent_size = 1024 // 8  # = 128
     assert out.sample.shape == x.shape, f"输出形状不匹配! 预期 {x.shape}, 得到 {out.sample.shape}"
-    assert out.latent_dist.mean.shape == (1, 16, expected_latent_size, expected_latent_size), \
-        f"潜在形状错误: {out.latent_dist.mean.shape}, 预期 (1, 16, {expected_latent_size}, {expected_latent_size})"
+    assert out.latent_dist.mean.shape == (1, 32, expected_latent_size, expected_latent_size), \
+        f"潜在形状错误: {out.latent_dist.mean.shape}, 预期 (1, 32, {expected_latent_size}, {expected_latent_size})"
 
     print("✓ 前向传播测试通过 (1024 分辨率)")
 
@@ -155,7 +155,7 @@ def test_encode_decode_512(model):
 
     assert dec_out.sample.shape == x.shape, "解码输出形状不匹配"
     expected_latent_size = 512 // 8
-    assert z.shape == (1, 16, expected_latent_size, expected_latent_size), \
+    assert z.shape == (1, 32, expected_latent_size, expected_latent_size), \
         f"潜在变量形状错误: {z.shape}"
     print("✓ 编码/解码分离测试通过")
 
@@ -167,7 +167,7 @@ def test_decoder_independence(model):
     print("=" * 60)
 
     # 创建随机潜在变量 (512 分辨率对应 64x64 latent)
-    z = torch.randn(1, 16, 64, 64)
+    z = torch.randn(1, 32, 64, 64)
 
     model.eval()
     with torch.no_grad():
@@ -233,8 +233,8 @@ def test_gradient_flow(model):
     print(f"参数梯度: {params_with_grad}/{total_params} 个参数有梯度")
 
     # 验证latent维度 (256 / 8 = 32)
-    print(f"Latent 形状: {out.latent_dist.mean.shape}  (预期: [1, 16, 32, 32])")
-    assert out.latent_dist.mean.shape == (1, 16, 32, 32)
+    print(f"Latent 形状: {out.latent_dist.mean.shape}  (预期: [1, 32, 32, 32])")
+    assert out.latent_dist.mean.shape == (1, 32, 32, 32)
 
     print("✓ 梯度流动正常")
 
@@ -283,8 +283,8 @@ def test_wavelet_loss_computation():
     print("=" * 60)
 
     model = WFIVAE2Model(
-        latent_dim=16,
-        base_channels=[128, 256, 512],
+        latent_dim=32,
+        base_channels=[192, 384, 768],
         encoder_energy_flow_size=128,
         decoder_energy_flow_size=128,
     )
@@ -331,14 +331,14 @@ def test_dimension_flow(model):
 
         # conv_in
         h = model.encoder.conv_in(coeffs)
-        print(f"conv_in: {h.shape} (期望 [1, 128, 256, 256])")
-        assert h.shape == (1, 128, 256, 256)
+        print(f"conv_in: {h.shape} (期望 [1, 192, 256, 256])")
+        assert h.shape == (1, 192, 256, 256)
 
         # WFDownBlock × 2
         w = coeffs
         expected_shapes = [
-            ((1, 256, 128, 128), (1, 12, 128, 128)),   # down1: 128->256, 256->128
-            ((1, 512, 64, 64), (1, 12, 64, 64)),       # down2: 256->512, 128->64
+            ((1, 384, 128, 128), (1, 12, 128, 128)),   # down1: 192->384, 256->128
+            ((1, 768, 64, 64), (1, 12, 64, 64)),       # down2: 384->768, 128->64
         ]
 
         for i, down_block in enumerate(model.encoder.down_blocks):
@@ -357,17 +357,17 @@ def test_dimension_flow(model):
         from causalimagevae.model.modules import nonlinearity
         h = nonlinearity(h)
         h = model.encoder.conv_out(h)
-        print(f"编码器输出: {h.shape} (期望 [1, 32, 64, 64])")
-        assert h.shape == (1, 32, 64, 64)
+        print(f"编码器输出: {h.shape} (期望 [1, 64, 64, 64])")
+        assert h.shape == (1, 64, 64, 64)
 
         # 追踪解码器维度
         print("\n--- 解码器 ---")
-        z = h[:, :16, :, :]  # 只取均值部分 (latent_dim=16)
+        z = h[:, :32, :, :]  # 只取均值部分 (latent_dim=32)
         print(f"潜在变量: {z.shape}")
 
         h = model.decoder.conv_in(z)
-        print(f"解码器conv_in: {h.shape} (期望 [1, 512, 64, 64])")
-        assert h.shape == (1, 512, 64, 64)
+        print(f"解码器conv_in: {h.shape} (期望 [1, 768, 64, 64])")
+        assert h.shape == (1, 768, 64, 64)
 
         # mid layers
         h = model.decoder.mid(h)
@@ -375,8 +375,8 @@ def test_dimension_flow(model):
 
         # WFUpBlock × 2
         expected_up_shapes = [
-            ((1, 256, 128, 128), (1, 3, 128, 128)),   # up1: 512->256, 64->128
-            ((1, 128, 256, 256), (1, 3, 256, 256)),   # up2: 256->128, 128->256
+            ((1, 384, 128, 128), (1, 3, 128, 128)),   # up1: 768->384, 64->128
+            ((1, 192, 256, 256), (1, 3, 256, 256)),   # up2: 384->192, 128->256
         ]
 
         w = None
@@ -412,7 +412,7 @@ def test_config_loading():
     print("测试11: 从配置文件加载模型")
     print("=" * 60)
 
-    config_path = Path("examples/wfivae2-image-16chn.json")
+    config_path = Path("examples/wfivae2-image-192bc.json")
     if config_path.exists():
         print(f"从配置文件加载: {config_path}")
         model_cls = ModelRegistry.get_model("WFIVAE2")
@@ -483,8 +483,8 @@ def main():
         print("  - 2层 WFDownBlock (concat能量流融合)")
         print("  - 2层 WFUpBlock (outflow能量流重建)")
         print("  - 8x空间压缩 (小波2x × 下采样4x)")
-        print("  - 512: latent [16, 64, 64]")
-        print("  - 1024: latent [16, 128, 128]")
+        print("  - 512: latent [32, 64, 64]")
+        print("  - 1024: latent [32, 128, 128]")
         print("  - 小波损失: 2个部分 (对应2个下采样层)")
         print("  - 解码器独立重建，无skip connection")
 

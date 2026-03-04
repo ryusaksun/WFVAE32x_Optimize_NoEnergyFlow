@@ -29,19 +29,13 @@ RESUME_CKPT="/path/to/checkpoint.ckpt" bash train_wfivae.sh
 # Override common parameters
 RESOLUTION=512 BATCH_SIZE=8 EPOCHS=500 EVAL_STEPS=500 bash train_wfivae.sh
 
-# Resume and refresh dead discriminator (reinitialize weights + warmup)
-RESUME_CKPT="/path/to/checkpoint.ckpt" REFRESH_DISC=1 bash train_wfivae.sh
-
-# Periodic discriminator refresh every 10k steps
-DISC_REFRESH_EVERY=10000 bash train_wfivae.sh
-
 # Direct torchrun (low-level, requires manual dataset setup)
 torchrun --nproc_per_node=8 train_image_ddp.py \
     --exp_name WFIVAE_1024 \
     --image_path /path/to/train_images \
     --eval_image_path /path/to/eval_images \
     --model_name WFIVAE2 \
-    --model_config examples/wfivae2-image-1024.json \
+    --model_config examples/wfivae2-image-192bc.json \
     --resolution 1024 --batch_size 2 --lr 1e-5 \
     --ema --wavelet_loss --eval_lpips
 ```
@@ -56,7 +50,7 @@ python scripts/test_imagevae.py
 python3 -m py_compile train_image_ddp.py
 bash -n train_wfivae.sh
 ```
-If you changed dataset or validation output, run a minimal training to the first validation to confirm `val_patch_scores/`, `training_curves.png` generate correctly.
+If you changed dataset or validation output, run a minimal training to the first validation to confirm `training_curves.png` generates correctly.
 
 ### Inference
 ```bash
@@ -81,6 +75,27 @@ The core innovation is explicit frequency-domain information flow via Haar wavel
 
 Key: the decoder is fully independent — no skip connections from encoder. Energy flow is reconstructed entirely from the latent.
 
+### Channel Dimension Flow (192bc config, 512px input)
+
+**Encoder** (spatial: 512→256→128→64):
+```
+[3, 512]  →Wavelet→  [12, 256]  →conv_in→  [192, 256]
+  →WFDownBlock1: ResBlock(192) → Downsample → concat [192+128 flow] → ResBlock(320→384)  → [384, 128]
+  →WFDownBlock2: ResBlock(384) → Downsample → concat [384+128 flow] → ResBlock(512→768)  → [768, 64]
+  →Mid(768) → norm → conv_out(768→64)  → [64, 64]   (64 = 2×latent_dim: mean+var)
+```
+
+**Decoder** (spatial: 64→128→256→512):
+```
+[32, 64]  →conv_in→  [768, 64]  →Mid(768)
+  →WFUpBlock1: branch(768→896) → split [768 main | 128 flow→12→InvWavelet→w] → ResBlock→Up→ResBlock(768→384) → [384, 128]
+  →WFUpBlock2: branch(384→512) → split [384 main | 128 flow→12→InvWavelet→w] → ResBlock→Up→ResBlock(384→192) → [192, 256]
+  →norm → conv_out(192→12) → merge w → InvWavelet → [3, 512]
+```
+
+WFDownBlock energy flow: wavelet coefficients (12ch) → `in_flow_conv` (12→`energy_flow_size`) → concat with main trunk.
+WFUpBlock energy flow: split `energy_flow_size` channels from branch output → `out_flow_conv` → 12ch wavelet coefficients → InverseWavelet → RGB residual `w`.
+
 ### Training Loop Design
 
 `train_image_ddp.py` uses **alternating optimization** via `current_step % 2`: even steps (0, 2, 4…) optimize the generator, odd steps (1, 3, 5…) optimize the discriminator. The discriminator only activates when `current_step >= disc_start` (default 80000, this repo uses 5). Discriminator weight is computed adaptively based on gradient norms of the last decoder layer.
@@ -90,8 +105,6 @@ Key: the decoder is fully independent — no skip connections from encoder. Ener
 generator_loss = rec_loss/exp(logvar) + logvar + perceptual_loss + kl_loss + disc_loss + wavelet_loss
 ```
 where `disc_loss = -mean(D(recon)) * adaptive_weight * disc_factor` and `wavelet_loss = l1(encoder_coeffs, decoder_coeffs_reversed)`.
-
-**Discriminator refresh**: If the discriminator collapses (disc_loss stuck at 1.0), it can be reinitialized via `--refresh_discriminator` (at resume) or `--disc_refresh_every N` (periodic). After refresh, a warmup period (`--disc_refresh_warmup`, default 100 steps) trains only the discriminator before resuming alternating optimization. Auto-refresh (`--disc_auto_refresh`) monitors a rolling window and triggers refresh when disc_loss mean > threshold with low std (stale detection).
 
 **TTUR**: Discriminator can use a separate learning rate (`--disc_lr`, default same as generator). Two Time-scale Update Rule recommends 2-4× the generator LR for faster discriminator convergence.
 
@@ -122,7 +135,7 @@ model = model_cls.from_config("examples/wfivae2-image-1024.json")
 | Model | `causalimagevae/model/vae/modeling_wfvae2.py` |
 | Wavelet | `causalimagevae/model/modules/wavelet.py` |
 | Loss/Discriminator | `causalimagevae/model/losses/perceptual_loss_2d.py` |
-| PatchGAN | `causalimagevae/model/losses/discriminator.py` |
+| Discriminator | `causalimagevae/model/losses/discriminator.py` |
 | EMA | `causalimagevae/model/ema_model.py` |
 | Registry | `causalimagevae/model/registry.py` |
 | DDP Sampler | `causalimagevae/dataset/ddp_sampler.py` |
@@ -133,7 +146,7 @@ model = model_cls.from_config("examples/wfivae2-image-1024.json")
 | Parameter | Value |
 |-----------|-------|
 | `--model_name` | WFIVAE2 |
-| `--model_config` | wfivae2-image-16chn.json (default), wfivae2-image-1024.json (8chn legacy) |
+| `--model_config` | wfivae2-image-192bc.json (default), wfivae2-image-16chn.json (smaller), wfivae2-image-1024.json (8chn legacy) |
 | `--disc_cls` | causalimagevae.model.losses.LPIPSWithDiscriminator |
 | `--disc_start` | 5 (this repo), 80000 (default) |
 | `--kl_weight` | 1e-6 |
@@ -152,7 +165,7 @@ model = model_cls.from_config("examples/wfivae2-image-1024.json")
 | `--eval_subset_size` | 30 | Validation subset size (0 = full set) |
 | `--eval_num_image_log` | 20 | Number of validation images to save and visualize |
 
-CSV fields: `step, generator_loss, discriminator_loss, rec_loss, perceptual_loss, kl_loss, wavelet_loss, logvar, nll_loss, g_loss, d_weight, logits_real, logits_fake, r1_penalty, r1_effective_weight, nll_grads_norm, g_grads_norm, psnr, lpips, psnr_ema, lpips_ema`. Output to `{ckpt_dir}/{exp_name}.csv`. A row with `generator_loss=DISC_REFRESH` marks discriminator refresh events.
+CSV fields: `step, generator_loss, discriminator_loss, rec_loss, perceptual_loss, kl_loss, wavelet_loss, nll_loss, g_loss, d_weight, logits_real, logits_fake, nll_grads_norm, g_grads_norm, psnr, lpips, psnr_ema, lpips_ema`. Output to `{ckpt_dir}/{exp_name}.csv`.
 
 Plot files: `training_curves.png` (at checkpoints), `training_curves_final.png` (normal completion), `training_curves_interrupted.png` (Ctrl+C). Features 7×3 subplot layout with smoothed curves and disc_start marker.
 
@@ -162,19 +175,19 @@ Under `{ckpt_dir}/{exp_name-lr...-bs...-rs...}/`:
 - `{exp_name}.csv` — metrics CSV
 - `training_curves*.png` — loss plots
 - `val_images/original/` and `val_images/reconstructed/` — validation images
-- `val_patch_scores/step_xxxxxxxx/` and `step_xxxxxxxx_ema/` — PatchGAN scores with `summary.csv` + `patch_vis/{real,recon}/*.png` heatmaps
 - `checkpoint-*.ckpt` — model + optimizer state
 
 ## Model Configs
 
 Located in `examples/`:
-- `wfivae2-image-16chn.json` — latent_dim=16, base_channels=[128,256,512] (default, aligned with official WF-VAE)
+- `wfivae2-image-192bc.json` — latent_dim=32, base_channels=[192,384,768] (default, aligned with official WF-VAE large config)
+- `wfivae2-image-16chn.json` — latent_dim=16, base_channels=[128,256,512] (smaller variant)
 - `wfivae2-image-1024.json` — latent_dim=8, base_channels=[128,256,512] (legacy)
 
 ### Latent Dimensions
-- 1024px input → latent shape `[B, 16, 128, 128]`
-- 512px input → latent shape `[B, 16, 64, 64]`
-- 256px input → latent shape `[B, 16, 32, 32]`
+- 1024px input → latent shape `[B, 32, 128, 128]` (192bc config) / `[B, 16, 128, 128]` (16chn config)
+- 512px input → latent shape `[B, 32, 64, 64]` / `[B, 16, 64, 64]`
+- 256px input → latent shape `[B, 32, 32, 32]` / `[B, 16, 32, 32]`
 - Spatial compression: 8× (2× wavelet + 4× from 2 downsampling blocks)
 
 ## Data Format
@@ -201,15 +214,7 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 | `LOG_STEPS` | `10` | Console logging frequency |
 | `DATASET_NUM_WORKER` | `8` | DataLoader workers |
 | `RESUME_CKPT` | — | Path to checkpoint for resumption |
-| `REFRESH_DISC` | — | Non-empty to reinitialize discriminator at resume |
-| `DISC_REFRESH_EVERY` | `0` | Periodic discriminator refresh interval (0=disabled) |
-| `DISC_REFRESH_WARMUP` | `100` | Disc-only training steps after each refresh |
 | `DISC_LR` | `1e-5` | Discriminator learning rate (TTUR: set 2-4× gen LR) |
-| `DISC_AUTO_REFRESH` | — | Non-empty to enable auto-refresh on stale detection |
-| `DISC_STALE_WINDOW` | `500` | Rolling window size for stale detection |
-| `DISC_STALE_LOSS` | `0.8` | disc_loss mean threshold for staleness |
-| `DISC_STALE_STD` | `0.02` | disc_loss std threshold for staleness |
-| `DISC_AUTO_COOLDOWN` | `5000` | Cooldown steps between auto-refreshes |
 | `LEARN_LOGVAR` | — | Non-empty to enable learned logvar |
 | `LOGVAR_LR` | `1e-2` | Learning rate for logvar parameter |
 | `ORIGINAL_MANIFEST` | `/mnt/sdb/kinetics400_frames/train_manifest.jsonl` | Training JSONL manifest path |
@@ -219,9 +224,6 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 | `TRAIN_RATIO` | `0.9` | Train/val split ratio (only when no VAL_MANIFEST) |
 | `MIX_PRECISION` | `bf16` | Training precision: `bf16`, `fp16`, or `fp32` |
 | `ADAPTIVE_WEIGHT_CLAMP` | `1e6` | Max adaptive weight for discriminator |
-| `R1_WEIGHT` | `0` | R1 gradient penalty weight (0=disabled) |
-| `R1_START` | `0` | Step to begin R1 penalty |
-| `R1_WARMUP_STEPS` | `0` | Linear warmup steps for R1 (0=instant) |
 
 ## Distributed Training Notes
 
@@ -233,7 +235,6 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 ## High-Risk Modification Points
 
 - DDP gather logic in `train_image_ddp.py` uses `all_gather_object` — changing validation return structure requires updating the gather/logging/save chain together
-- Patch score export depends on `index` field in validation batches; both `ValidImageDataset` and `ValidManifestImageDataset` provide it — don't drop it when modifying datasets
 - Checkpoint discriminator key is `dics_model` (typo) — renaming breaks old checkpoint loading
 - Do not modify data paths to your local private paths without confirmation
 
@@ -242,4 +243,3 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 When upgrading scripts or workflows, keep these docs in sync:
 - `README_image_training.md`
 - `QUICK_REFERENCE.md`
-- `CONFIG_1024.md`

@@ -28,10 +28,7 @@
 # 7. 指定分辨率（512 或 1024，默认 1024）：
 #    RESOLUTION=512 bash train_wfivae.sh
 #
-# 8. 使用完整验证集输出 PatchGAN patch 分数（默认开启）：
-#    EVAL_SUBSET_SIZE=0 bash train_wfivae.sh
-#
-# 9. 覆盖训练步频参数：
+# 8. 覆盖训练步频参数：
 #    EVAL_STEPS=500 SAVE_CKPT_STEP=1000 EPOCHS=500 bash train_wfivae.sh
 #
 # ============================================
@@ -93,7 +90,6 @@ fi
 # 损失日志功能 (自动启用):
 # - CSV 日志: ${OUTPUT_DIR}/${EXP_NAME}/${EXP_NAME}.csv
 # - 训练曲线图: 每次验证后自动更新
-# - PatchGAN patch 分数: ${OUTPUT_DIR}/${EXP_NAME}/val_patch_scores/step_xxxxxxxx(_ema)/
 # - 使用 --csv_log_steps 调整日志频率
 # - 使用 --disable_plot 禁用自动绘图
 #
@@ -129,25 +125,25 @@ EPOCHS="${EPOCHS:-1000}"
 SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-2000}"
 EVAL_STEPS="${EVAL_STEPS:-1000}"
 EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-30}"     # 验证子集大小，0 表示使用完整验证集
-EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-20}"  # 验证重建图与 patch 可视化样本数量（默认保持一致）
+EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-20}"  # 验证重建图样本数量
 CSV_LOG_STEPS="${CSV_LOG_STEPS:-50}"
 LOG_STEPS="${LOG_STEPS:-10}"
 DATASET_NUM_WORKER="${DATASET_NUM_WORKER:-8}"
 
 # 根据分辨率选择默认配置 (EXP_NAME 包含 disc5 标识)
 if [ "$RESOLUTION" = "1024" ]; then
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-16chn.json"
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-192bc.json"
     DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-2}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
 elif [ "$RESOLUTION" = "256" ]; then
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-16chn.json"
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-192bc.json"
     DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-16}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 else
     # 512 或其他分辨率，模型配置通用（无分辨率参数）
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-16chn.json"
+    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-192bc.json"
     DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-8}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
@@ -162,11 +158,6 @@ TRAIN_RATIO="${TRAIN_RATIO:-0.9}"
 # Resume设置（可选）
 RESUME_CKPT="${RESUME_CKPT:-}"
 
-# 判别器刷新设置
-REFRESH_DISC="${REFRESH_DISC:-}"                   # 非空则恢复时刷新判别器
-DISC_REFRESH_EVERY="${DISC_REFRESH_EVERY:-0}"      # 每N步刷新判别器（0=禁用）
-DISC_REFRESH_WARMUP="${DISC_REFRESH_WARMUP:-100}"  # 刷新后判别器独占训练步数
-
 # 判别器学习率（默认与生成器一致；TTUR 建议设为 2-4 倍）
 DISC_LR="${DISC_LR:-1e-5}"                             # 判别器学习率，默认与生成器一致(1e-5)
 
@@ -180,18 +171,6 @@ MIX_PRECISION="${MIX_PRECISION:-bf16}"
 # 学习 logvar（自动平衡重建损失与 GAN 损失的量级）
 LEARN_LOGVAR="${LEARN_LOGVAR:-}"                         # 非空启用，默认关闭
 LOGVAR_LR="${LOGVAR_LR:-1e-2}"                            # logvar 独立学习率（快速找到均衡点）
-
-# R1 梯度惩罚（防止判别器过拟合，0=禁用）
-R1_WEIGHT="${R1_WEIGHT:-0}"
-R1_START="${R1_START:-0}"                               # R1 开始生效的 step（0=从头开始）
-R1_WARMUP_STEPS="${R1_WARMUP_STEPS:-0}"                 # R1 线性 warmup 步数（0=立即满值）
-
-# 判别器自动刷新（停滞检测）
-DISC_AUTO_REFRESH="${DISC_AUTO_REFRESH:-}"            # 非空启用自动刷新
-DISC_STALE_WINDOW="${DISC_STALE_WINDOW:-500}"         # 滚动窗口大小（判别器步数）
-DISC_STALE_LOSS="${DISC_STALE_LOSS:-0.8}"             # disc_loss 均值阈值
-DISC_STALE_STD="${DISC_STALE_STD:-0.02}"              # disc_loss 标准差阈值
-DISC_AUTO_COOLDOWN="${DISC_AUTO_COOLDOWN:-5000}"       # 自动刷新冷却步数
 
 # ============================================
 # 创建输出目录
@@ -311,7 +290,6 @@ echo "学习率: gen=1e-5, disc=$DISC_LR (TTUR)"
 echo "自适应权重 clamp: $ADAPTIVE_WEIGHT_CLAMP"
 echo "训练精度: $MIX_PRECISION"
 echo "Learn logvar: ${LEARN_LOGVAR:-禁用} (lr=$LOGVAR_LR)"
-echo "R1 梯度惩罚: $R1_WEIGHT (start=$R1_START, warmup=$R1_WARMUP_STEPS)"
 echo "WandB: $WANDB_STATUS"
 if [ "$EVAL_SUBSET_SIZE" = "0" ]; then
     echo "验证样本数: 全量"
@@ -337,20 +315,9 @@ echo "================================================"
 if [ -n "$RESUME_CKPT" ]; then
     echo "RESUME MODE: ON"
     echo "Checkpoint: $RESUME_CKPT"
-    if [ -n "$REFRESH_DISC" ]; then
-        echo "判别器刷新: ON (恢复时重新初始化)"
-    fi
     echo "================================================"
 else
     echo "RESUME MODE: OFF (从头开始训练)"
-    echo "================================================"
-fi
-if [ "$DISC_REFRESH_EVERY" -gt 0 ] 2>/dev/null; then
-    echo "判别器定期刷新: 每 ${DISC_REFRESH_EVERY} 步, warmup ${DISC_REFRESH_WARMUP} 步"
-    echo "================================================"
-fi
-if [ -n "$DISC_AUTO_REFRESH" ]; then
-    echo "判别器自动刷新: ON (window=${DISC_STALE_WINDOW}, loss>${DISC_STALE_LOSS}, std<${DISC_STALE_STD}, cooldown=${DISC_AUTO_COOLDOWN})"
     echo "================================================"
 fi
 
@@ -433,9 +400,6 @@ TRAIN_ARGS=(
     --disc_weight 0.5
     --disc_lr "$DISC_LR"
     --adaptive_weight_clamp "$ADAPTIVE_WEIGHT_CLAMP"
-    --r1_weight "$R1_WEIGHT"
-    --r1_start "$R1_START"
-    --r1_warmup_steps "$R1_WARMUP_STEPS"
     --kl_weight 1e-6
     --perceptual_weight 1.0
     --loss_type l1
@@ -448,16 +412,8 @@ TRAIN_ARGS=(
     --dataset_num_worker "$DATASET_NUM_WORKER"
     $WANDB_ARGS
     --find_unused_parameters
-    --disc_refresh_every "$DISC_REFRESH_EVERY"
-    --disc_refresh_warmup "$DISC_REFRESH_WARMUP"
-    ${REFRESH_DISC:+--refresh_discriminator}
     ${LEARN_LOGVAR:+--learn_logvar}
     --logvar_lr "$LOGVAR_LR"
-    ${DISC_AUTO_REFRESH:+--disc_auto_refresh}
-    --disc_stale_window "$DISC_STALE_WINDOW"
-    --disc_stale_loss_threshold "$DISC_STALE_LOSS"
-    --disc_stale_std_threshold "$DISC_STALE_STD"
-    --disc_auto_refresh_cooldown "$DISC_AUTO_COOLDOWN"
     "${RESUME_ARGS[@]}"
 )
 

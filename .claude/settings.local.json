@@ -26,7 +26,8 @@
       "Bash(echo exit: $?:*)",
       "Bash(git status:*)",
       "Bash(ssh:*)",
-      "Bash(scp:*)"
+      "Bash(scp:*)",
+      "Bash(curl:*)"
     ]
   }
 }

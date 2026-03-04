@@ -8,15 +8,12 @@ import argparse
 import logging
 import tqdm
 from itertools import chain
-from collections import deque
 from contextlib import nullcontext
 import random
 import numpy as np
 from pathlib import Path
-from PIL import Image, ImageDraw
 from causalimagevae.model import *
 from causalimagevae.model.ema_model import EMA
-from causalimagevae.model.losses.discriminator import weights_init
 from causalimagevae.dataset.ddp_sampler import CustomDistributedSampler
 from causalimagevae.dataset.image_dataset import ImageDataset, ValidImageDataset
 from causalimagevae.model.utils.module_utils import resolve_str_to_obj
@@ -105,7 +102,6 @@ def save_checkpoint(
     checkpoint_dir,
     filename="checkpoint.ckpt",
     ema_state_dict=None,
-    disc_refresh_state=None,
 ):
     filepath = checkpoint_dir / Path(filename)
     data = {
@@ -117,335 +113,10 @@ def save_checkpoint(
         "scaler_state": scaler_state,
         "sampler_state": sampler_state,
     }
-    if disc_refresh_state is not None:
-        data["disc_refresh_state"] = disc_refresh_state
     torch.save(data, filepath)
     return filepath
 
-def _extract_patch_maps(logits):
-    logits = logits.detach().float().cpu()
-    if logits.dim() == 4:
-        if logits.shape[1] == 1:
-            return logits[:, 0]
-        return logits.mean(dim=1)
-    if logits.dim() == 3:
-        return logits
-    raise ValueError(f"Unexpected PatchGAN logits shape: {tuple(logits.shape)}")
-
-def _safe_file_stem(file_name, fallback):
-    stem = Path(file_name).stem if file_name else fallback
-    cleaned = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in stem).strip("._")
-    return cleaned or fallback
-
-def _resolve_sample_image_path(val_dataset, sample_idx):
-    base_dataset = val_dataset.dataset if isinstance(val_dataset, Subset) else val_dataset
-    if not hasattr(base_dataset, "samples"):
-        return None
-
-    samples = base_dataset.samples
-    if sample_idx < 0 or sample_idx >= len(samples):
-        return None
-
-    sample = samples[sample_idx]
-    if isinstance(sample, str):
-        return sample
-
-    if isinstance(sample, dict):
-        image_path = sample.get("image_path", sample.get("path", sample.get("target", "")))
-        if image_path and (not os.path.isabs(image_path)):
-            base_dir = getattr(base_dataset, "base_dir", "")
-            if base_dir:
-                image_path = os.path.join(base_dir, image_path)
-        return image_path or None
-
-    return None
-
-def _resize_and_center_crop(image, resolution):
-    bilinear = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
-    width, height = image.size
-    short_side = min(width, height)
-    if short_side <= 0:
-        raise ValueError("Invalid image size.")
-
-    scale = float(resolution) / float(short_side)
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-    image = image.resize((new_width, new_height), resample=bilinear)
-
-    left = max(0, (new_width - resolution) // 2)
-    top = max(0, (new_height - resolution) // 2)
-    return image.crop((left, top, left + resolution, top + resolution))
-
-def _load_aligned_image(val_dataset, sample_idx, eval_resolution):
-    image_path = _resolve_sample_image_path(val_dataset, sample_idx)
-    if image_path is None:
-        return None
-
-    try:
-        image = Image.open(image_path).convert("RGB")
-        image = _resize_and_center_crop(image, eval_resolution)
-        return np.asarray(image, dtype=np.uint8)
-    except Exception:
-        return None
-
-def _tensor_image_to_uint8(image_tensor):
-    if not torch.is_tensor(image_tensor):
-        return None
-
-    image = image_tensor.detach().float().cpu().clamp(0, 1)
-    if image.dim() != 3:
-        return None
-    if image.shape[0] in (1, 3):
-        image = image.permute(1, 2, 0).contiguous()
-    if image.shape[-1] == 1:
-        image = image.repeat(1, 1, 3)
-    if image.shape[-1] != 3:
-        return None
-
-    return (image.numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
-
-def _resize_patch_map(score_map, out_height, out_width):
-    h, w = score_map.shape
-    row_idx = (np.arange(out_height) * h / out_height).astype(int).clip(0, h - 1)
-    col_idx = (np.arange(out_width) * w / out_width).astype(int).clip(0, w - 1)
-    return score_map[row_idx[:, None], col_idx[None, :]]
-
-def _colorize_score_map(score_map):
-    score_map = np.clip(score_map, 0.0, 1.0)
-    r = np.clip(1.5 - np.abs(4.0 * score_map - 3.0), 0.0, 1.0)
-    g = np.clip(1.5 - np.abs(4.0 * score_map - 2.0), 0.0, 1.0)
-    b = np.clip(1.5 - np.abs(4.0 * score_map - 1.0), 0.0, 1.0)
-    return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
-
-def _draw_patch_grid(image_rgb, grid_h, grid_w, color):
-    image = Image.fromarray(image_rgb)
-    draw = ImageDraw.Draw(image)
-    height, width = image_rgb.shape[:2]
-
-    for col in range(1, grid_w):
-        x = int(round(col * width / grid_w))
-        draw.line([(x, 0), (x, height)], fill=color, width=1)
-    for row in range(1, grid_h):
-        y = int(round(row * height / grid_h))
-        draw.line([(0, y), (width, y)], fill=color, width=1)
-    return np.asarray(image, dtype=np.uint8)
-
-def _make_colorbar(height, vmin, vmax, bar_width=30, total_width=90):
-    """生成垂直 colorbar，标注 vmin/vmax"""
-    canvas = np.full((height, total_width, 3), 255, dtype=np.uint8)
-    margin = 10
-    bar_height = height - 2 * margin
-
-    # 渐变色条 (top=vmax, bottom=vmin)
-    gradient = np.linspace(1.0, 0.0, bar_height).reshape(-1, 1)
-    gradient = np.repeat(gradient, bar_width, axis=1)
-    colored = _colorize_score_map(gradient)
-    canvas[margin:margin + bar_height, 5:5 + bar_width] = colored
-
-    # 用 PIL 写文字
-    img = Image.fromarray(canvas)
-    draw = ImageDraw.Draw(img)
-    text_x = 5 + bar_width + 3
-    draw.text((text_x, margin - 2), f"{vmax:.3f}", fill=(0, 0, 0))
-    draw.text((text_x, margin + bar_height - 10), f"{vmin:.3f}", fill=(0, 0, 0))
-
-    return np.asarray(img, dtype=np.uint8)
-
-def _build_patch_score_panel(base_image, score_map):
-    score_map = np.asarray(score_map, dtype=np.float32)
-    grid_h, grid_w = score_map.shape
-    height, width = base_image.shape[:2]
-
-    # Per-image normalization
-    vmin, vmax = float(score_map.min()), float(score_map.max())
-    if vmax - vmin < 1e-6:
-        normalized = np.full_like(score_map, 0.5)
-    else:
-        normalized = (score_map - vmin) / (vmax - vmin)
-
-    upsampled = _resize_patch_map(normalized, height, width)
-    heatmap = _colorize_score_map(upsampled)
-    overlay = (
-        0.55 * base_image.astype(np.float32) + 0.45 * heatmap.astype(np.float32)
-    ).clip(0, 255).astype(np.uint8)
-
-    # 只在 cell 足够大时画网格
-    cell_size = min(width / grid_w, height / grid_h)
-    if cell_size >= 32:
-        original_grid = _draw_patch_grid(base_image.copy(), grid_h, grid_w, color=(180, 180, 180))
-        heatmap_grid = _draw_patch_grid(heatmap, grid_h, grid_w, color=(255, 255, 255))
-        overlay_grid = _draw_patch_grid(overlay, grid_h, grid_w, color=(255, 255, 255))
-    else:
-        original_grid = base_image.copy()
-        heatmap_grid = heatmap
-        overlay_grid = overlay
-
-    # 生成 colorbar
-    colorbar = _make_colorbar(height, vmin, vmax)
-
-    return np.concatenate([original_grid, heatmap_grid, overlay_grid, colorbar], axis=1)
-
-def _save_patch_score_visualizations(
-    ordered_records,
-    output_dir,
-    val_dataset,
-    eval_resolution,
-    vis_max_samples,
-    selected_sample_indices=None,
-    recon_image_by_sample_idx=None,
-):
-    if vis_max_samples is not None and vis_max_samples <= 0:
-        return
-    if len(ordered_records) == 0:
-        return
-
-    if eval_resolution is None or eval_resolution <= 0:
-        first_map = np.asarray(ordered_records[0]["real_sigmoid"], dtype=np.float32)
-        eval_resolution = int(max(first_map.shape))
-
-    real_dir = output_dir / "patch_vis" / "real"
-    recon_dir = output_dir / "patch_vis" / "recon"
-    real_dir.mkdir(exist_ok=True, parents=True)
-    recon_dir.mkdir(exist_ok=True, parents=True)
-
-    selected_records = ordered_records
-    if selected_sample_indices is not None:
-        sample_idx_to_record = {
-            int(record["sample_idx"]): record for record in ordered_records
-        }
-        selected_records = [
-            sample_idx_to_record[sample_idx]
-            for sample_idx in selected_sample_indices
-            if sample_idx in sample_idx_to_record
-        ]
-
-    max_samples = (
-        len(selected_records)
-        if vis_max_samples is None
-        else min(len(selected_records), int(vis_max_samples))
-    )
-    selected_records = selected_records[:max_samples]
-
-    for row_id, record in enumerate(selected_records):
-        sample_idx = int(record["sample_idx"])
-        file_name = record.get("file_name", "")
-        fallback_name = f"sample_{sample_idx:08d}"
-        stem = _safe_file_stem(file_name, fallback_name)
-        image_name = f"{row_id:05d}_{sample_idx:08d}_{stem}.png"
-
-        real_base_image = _load_aligned_image(val_dataset, sample_idx, eval_resolution) if val_dataset is not None else None
-        if real_base_image is None:
-            real_base_image = np.full((eval_resolution, eval_resolution, 3), 127, dtype=np.uint8)
-
-        recon_base_image = None
-        if recon_image_by_sample_idx is not None:
-            recon_base_image = recon_image_by_sample_idx.get(sample_idx)
-        if recon_base_image is None:
-            recon_base_image = real_base_image
-
-        real_panel = _build_patch_score_panel(real_base_image, record["real_sigmoid"])
-        recon_panel = _build_patch_score_panel(recon_base_image, record["recon_sigmoid"])
-
-        Image.fromarray(real_panel).save(real_dir / image_name)
-        Image.fromarray(recon_panel).save(recon_dir / image_name)
-
-def save_patch_scores(
-    patch_records,
-    output_dir,
-    val_dataset=None,
-    eval_resolution=256,
-    vis_max_samples=None,
-    selected_sample_indices=None,
-    recon_image_by_sample_idx=None,
-):
-    if len(patch_records) == 0:
-        return
-
-    output_dir.mkdir(exist_ok=True, parents=True)
-    ordered_records = sorted(patch_records, key=lambda x: int(x["sample_idx"]))
-
-    summary_path = output_dir / "summary.csv"
-    fieldnames = [
-        "sample_idx", "file_name", "row_id",
-        "real_logits_mean", "real_logits_std", "real_logits_min", "real_logits_max",
-        "recon_logits_mean", "recon_logits_std", "recon_logits_min", "recon_logits_max",
-        "real_sigmoid_mean", "real_sigmoid_std", "real_sigmoid_min", "real_sigmoid_max",
-        "recon_sigmoid_mean", "recon_sigmoid_std", "recon_sigmoid_min", "recon_sigmoid_max",
-    ]
-    with open(summary_path, "w", newline="") as summary_file:
-        writer = csv.DictWriter(summary_file, fieldnames=fieldnames)
-        writer.writeheader()
-        for row_id, record in enumerate(ordered_records):
-            real_logits = np.asarray(record["real_logits"], dtype=np.float32)
-            recon_logits = np.asarray(record["recon_logits"], dtype=np.float32)
-            real_sigmoid = np.asarray(record["real_sigmoid"], dtype=np.float32)
-            recon_sigmoid = np.asarray(record["recon_sigmoid"], dtype=np.float32)
-
-            writer.writerow({
-                "sample_idx": int(record["sample_idx"]),
-                "file_name": record.get("file_name", ""),
-                "row_id": row_id,
-                "real_logits_mean": float(real_logits.mean()),
-                "real_logits_std": float(real_logits.std()),
-                "real_logits_min": float(real_logits.min()),
-                "real_logits_max": float(real_logits.max()),
-                "recon_logits_mean": float(recon_logits.mean()),
-                "recon_logits_std": float(recon_logits.std()),
-                "recon_logits_min": float(recon_logits.min()),
-                "recon_logits_max": float(recon_logits.max()),
-                "real_sigmoid_mean": float(real_sigmoid.mean()),
-                "real_sigmoid_std": float(real_sigmoid.std()),
-                "real_sigmoid_min": float(real_sigmoid.min()),
-                "real_sigmoid_max": float(real_sigmoid.max()),
-                "recon_sigmoid_mean": float(recon_sigmoid.mean()),
-                "recon_sigmoid_std": float(recon_sigmoid.std()),
-                "recon_sigmoid_min": float(recon_sigmoid.min()),
-                "recon_sigmoid_max": float(recon_sigmoid.max()),
-            })
-
-    _save_patch_score_visualizations(
-        ordered_records=ordered_records,
-        output_dir=output_dir,
-        val_dataset=val_dataset,
-        eval_resolution=int(eval_resolution) if eval_resolution is not None else None,
-        vis_max_samples=vis_max_samples,
-        selected_sample_indices=selected_sample_indices,
-        recon_image_by_sample_idx=recon_image_by_sample_idx,
-    )
-
-def log_patch_scores_to_wandb(patch_records, step, prefix, use_wandb=True):
-    if (not use_wandb) or wandb is None or len(patch_records) == 0:
-        return
-
-    ordered_records = sorted(patch_records, key=lambda x: int(x["sample_idx"]))
-    real_logits_flat = np.concatenate(
-        [np.asarray(record["real_logits"], dtype=np.float32).reshape(-1) for record in ordered_records]
-    )
-    recon_logits_flat = np.concatenate(
-        [np.asarray(record["recon_logits"], dtype=np.float32).reshape(-1) for record in ordered_records]
-    )
-    real_sigmoid_flat = np.concatenate(
-        [np.asarray(record["real_sigmoid"], dtype=np.float32).reshape(-1) for record in ordered_records]
-    )
-    recon_sigmoid_flat = np.concatenate(
-        [np.asarray(record["recon_sigmoid"], dtype=np.float32).reshape(-1) for record in ordered_records]
-    )
-
-    wandb.log(
-        {
-            f"{prefix}/patch_real_logits_mean": float(real_logits_flat.mean()),
-            f"{prefix}/patch_recon_logits_mean": float(recon_logits_flat.mean()),
-            f"{prefix}/patch_real_sigmoid_mean": float(real_sigmoid_flat.mean()),
-            f"{prefix}/patch_recon_sigmoid_mean": float(recon_sigmoid_flat.mean()),
-            f"{prefix}/patch_real_logits_hist": wandb.Histogram(real_logits_flat),
-            f"{prefix}/patch_recon_logits_hist": wandb.Histogram(recon_logits_flat),
-            f"{prefix}/patch_real_sigmoid_hist": wandb.Histogram(real_sigmoid_flat),
-            f"{prefix}/patch_recon_sigmoid_hist": wandb.Histogram(recon_sigmoid_flat),
-        },
-        step=step,
-    )
-
-def valid(global_rank, rank, model, discriminator, val_dataloader, precision, args, lpips_model=None):
+def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model=None):
 
     bar = None
     if global_rank == 0:
@@ -456,7 +127,6 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
     orig_images = []
     recon_images = []
     logged_sample_indices = []
-    patch_records = []
     num_image_log = args.eval_num_image_log
 
     with torch.no_grad():
@@ -471,32 +141,9 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
             else:
                 sample_indices = [int(i) for i in sample_indices]
 
-            file_names = batch.get("file_name")
-            if file_names is None:
-                file_names = [f"sample_{sample_indices[i]}" for i in range(inputs.shape[0])]
-            else:
-                file_names = list(file_names)
-
             with torch.amp.autocast("cuda", dtype=precision):
                 output = model(inputs)
                 image_recon = output.sample
-                logits_real = discriminator(inputs)
-                logits_recon = discriminator(image_recon)
-
-            real_logits_maps = _extract_patch_maps(logits_real)
-            recon_logits_maps = _extract_patch_maps(logits_recon)
-            real_sigmoid_maps = torch.sigmoid(real_logits_maps)
-            recon_sigmoid_maps = torch.sigmoid(recon_logits_maps)
-
-            for i in range(len(image_recon)):
-                patch_records.append({
-                    "sample_idx": int(sample_indices[i]),
-                    "file_name": file_names[i] if i < len(file_names) else f"sample_{sample_indices[i]}",
-                    "real_logits": real_logits_maps[i].numpy(),
-                    "recon_logits": recon_logits_maps[i].numpy(),
-                    "real_sigmoid": real_sigmoid_maps[i].numpy(),
-                    "recon_sigmoid": recon_sigmoid_maps[i].numpy(),
-                })
 
             # Collect images for logging
             if global_rank == 0:
@@ -532,40 +179,27 @@ def valid(global_rank, rank, model, discriminator, val_dataloader, precision, ar
             if global_rank == 0:
                 bar.update()
 
-    return psnr_list, lpips_list, orig_images, recon_images, patch_records, logged_sample_indices
+    return psnr_list, lpips_list, orig_images, recon_images, logged_sample_indices
 
-def gather_valid_result(psnr_list, lpips_list, orig_images, recon_images, patch_records, rank, world_size):
+def gather_valid_result(psnr_list, lpips_list, orig_images, recon_images, rank, world_size):
     gathered_psnr_list = [None for _ in range(world_size)]
     gathered_lpips_list = [None for _ in range(world_size)]
     gathered_orig_images = [None for _ in range(world_size)]
     gathered_recon_images = [None for _ in range(world_size)]
-    gathered_patch_records = [None for _ in range(world_size)]
 
     dist.all_gather_object(gathered_psnr_list, psnr_list)
     dist.all_gather_object(gathered_lpips_list, lpips_list)
     dist.all_gather_object(gathered_orig_images, orig_images)
     dist.all_gather_object(gathered_recon_images, recon_images)
-    dist.all_gather_object(gathered_patch_records, patch_records)
 
     all_psnr = list(chain(*gathered_psnr_list))
     all_lpips = list(chain(*gathered_lpips_list))
-    all_patch_records = list(chain(*gathered_patch_records))
-
-    patch_record_dict = {}
-    for record in all_patch_records:
-        sample_idx = int(record["sample_idx"])
-        if sample_idx not in patch_record_dict:
-            patch_record_dict[sample_idx] = record
-    deduplicated_patch_records = [
-        patch_record_dict[sample_idx] for sample_idx in sorted(patch_record_dict.keys())
-    ]
 
     return (
         float(np.mean(all_psnr)) if len(all_psnr) > 0 else float("nan"),
         float(np.mean(all_lpips)) if len(all_lpips) > 0 else float("nan"),
         list(chain(*gathered_orig_images)),
         list(chain(*gathered_recon_images)),
-        deduplicated_patch_records,
     )
 
 def _to_csv_scalar(value):
@@ -628,13 +262,6 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         print("Warning: CSV file is empty")
         return
 
-    # Extract discriminator refresh steps from marker rows
-    disc_refresh_steps = []
-    if 'generator_loss' in df.columns:
-        refresh_mask = df['generator_loss'].astype(str).str.strip().isin(['DISC_REFRESH', 'DISC_AUTO_REFRESH'])
-        refresh_rows = df.loc[refresh_mask, 'step']
-        disc_refresh_steps = pd.to_numeric(refresh_rows, errors='coerce').dropna().tolist()
-
     # Define metrics to plot
     metrics = [
         ('generator_loss', 'Generator Loss', 'tab:blue'),
@@ -643,14 +270,11 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         ('perceptual_loss', 'Perceptual Loss', 'tab:brown'),
         ('kl_loss', 'KL Loss', 'tab:red'),
         ('wavelet_loss', 'Wavelet Loss', 'tab:purple'),
-        ('logvar', 'Log Variance', 'teal'),
         ('nll_loss', 'NLL Loss', 'slateblue'),
         ('g_loss', 'GAN Loss (g_loss)', 'tab:cyan'),
         ('d_weight', 'Adaptive Weight (d_weight)', 'darkgoldenrod'),
         ('logits_real', 'Logits Real', 'forestgreen'),
         ('logits_fake', 'Logits Fake', 'tomato'),
-        ('r1_penalty', 'R1 Penalty', 'crimson'),
-        ('r1_effective_weight', 'R1 Effective Weight', 'hotpink'),
         ('nll_grads_norm', 'NLL Grad Norm', 'mediumpurple'),
         ('g_grads_norm', 'GAN Grad Norm', 'coral'),
         ('psnr', 'Validation PSNR', 'deepskyblue'),
@@ -714,11 +338,6 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
             ax.axvline(x=disc_start, color='red', linestyle='--',
                       linewidth=1, alpha=0.5)
 
-        # Draw discriminator refresh lines
-        for rs in disc_refresh_steps:
-            ax.axvline(x=rs, color='darkorange', linestyle=':',
-                      linewidth=1.2, alpha=0.7)
-
         ax.set_title(title, fontsize=12)
         ax.set_xlabel('Step', fontsize=10)
         ax.set_ylabel('Value', fontsize=10)
@@ -748,11 +367,13 @@ def train(args):
 
     # init
     ckpt_dir = Path(args.ckpt_dir) / Path(get_exp_name(args))
+    checkpoint_subdir = ckpt_dir / "checkpoints"
     if global_rank == 0:
         try:
             ckpt_dir.mkdir(exist_ok=False, parents=True)
         except:
             logger.warning(f"`{ckpt_dir}` exists!")
+        checkpoint_subdir.mkdir(exist_ok=True)
     dist.barrier()
 
     # load generator model
@@ -817,9 +438,6 @@ def train(args):
         loss_type=args.loss_type,
         wavelet_weight=args.wavelet_weight,
         adaptive_weight_clamp=args.adaptive_weight_clamp,
-        r1_weight=args.r1_weight,
-        r1_start=args.r1_start,
-        r1_warmup_steps=args.r1_warmup_steps,
         learn_logvar=args.learn_logvar,
     )
 
@@ -940,22 +558,7 @@ def train(args):
             gen_optimizer.load_state_dict(checkpoint["optimizer_state"]["gen_optimizer"])
 
         # resume discriminator
-        if args.refresh_discriminator:
-            # Refresh mode: reload non-discriminator weights (logvar, perceptual_loss),
-            # but reinitialize discriminator weights and optimizer from scratch.
-            full_disc_state = checkpoint["state_dict"]["dics_model"]
-            non_disc_keys = {k: v for k, v in full_disc_state.items() if not k.startswith("discriminator.")}
-            disc.module.load_state_dict(non_disc_keys, strict=False)
-            disc.module.discriminator.apply(weights_init)
-            # Broadcast rank 0 weights to all ranks to keep DDP in sync
-            for param in disc.module.discriminator.parameters():
-                dist.broadcast(param.data, src=0)
-            disc_optimizer = torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
-                lr=disc_lr, weight_decay=args.weight_decay,
-            )
-            logger.info("Discriminator REFRESHED at resume (weights reinitialized, optimizer reset).")
-        elif not args.not_resume_discriminator:
+        if not args.not_resume_discriminator:
             disc.module.load_state_dict(checkpoint["state_dict"]["dics_model"])
             if not args.not_resume_optimizer:
                 disc_optimizer.load_state_dict(checkpoint["optimizer_state"]["disc_optimizer"])
@@ -1004,9 +607,9 @@ def train(args):
         fieldnames = [
             "step", "generator_loss", "discriminator_loss",
             "rec_loss", "perceptual_loss", "kl_loss", "wavelet_loss",
-            "logvar", "nll_loss",
+            "nll_loss",
             "g_loss", "d_weight",
-            "logits_real", "logits_fake", "r1_penalty", "r1_effective_weight",
+            "logits_real", "logits_fake",
             "nll_grads_norm", "g_grads_norm",
             "psnr", "lpips", "psnr_ema", "lpips_ema",
         ]
@@ -1121,21 +724,6 @@ def train(args):
     last_gen_csv_logged_step = -args.csv_log_steps
     last_disc_csv_logged_step = -args.csv_log_steps
 
-    # Discriminator refresh tracking
-    last_disc_refresh_step = None
-    disc_loss_buffer = deque(maxlen=args.disc_stale_window)
-    if args.refresh_discriminator and args.resume_from_checkpoint:
-        last_disc_refresh_step = current_step
-        if global_rank == 0:
-            logger.info(f"Discriminator warmup active for {args.disc_refresh_warmup} steps starting at step {current_step}.")
-    elif args.resume_from_checkpoint and args.disc_auto_refresh and "disc_refresh_state" in checkpoint:
-        drs = checkpoint["disc_refresh_state"]
-        last_disc_refresh_step = drs.get("last_disc_refresh_step")
-        saved_buffer = drs.get("disc_loss_buffer", [])
-        disc_loss_buffer.extend(saved_buffer)
-        if global_rank == 0:
-            logger.info(f"Disc refresh state restored: last_refresh_step={last_disc_refresh_step}, buffer_len={len(disc_loss_buffer)}")
-
     def update_bar(bar):
         if global_rank == 0:
             bar.desc = bar_desc.format(current_epoch=epoch, loss=f"-")
@@ -1159,104 +747,8 @@ def train(args):
 
             inputs = batch["image"].to(rank)
 
-            # --- Periodic discriminator refresh ---
-            if (
-                args.disc_refresh_every > 0
-                and current_step > 0
-                and current_step % args.disc_refresh_every == 0
-                and (last_disc_refresh_step is None or current_step != last_disc_refresh_step)
-            ):
-                disc.module.discriminator.apply(weights_init)
-                # Broadcast rank 0 weights to all ranks to keep DDP in sync
-                for param in disc.module.discriminator.parameters():
-                    dist.broadcast(param.data, src=0)
-                disc_optimizer = torch.optim.AdamW(
-                    filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
-                    lr=disc_lr, weight_decay=args.weight_decay,
-                )
-                last_disc_refresh_step = current_step
-                if global_rank == 0:
-                    logger.info(f"[Disc Refresh] Periodic refresh at step {current_step}, warmup for {args.disc_refresh_warmup} steps.")
-                    if csv_writer is not None:
-                        try:
-                            csv_writer.writerow({
-                                "step": current_step,
-                                "generator_loss": "DISC_REFRESH",
-                                "discriminator_loss": "", "rec_loss": "",
-                                "perceptual_loss": "", "kl_loss": "",
-                                "wavelet_loss": "", "logvar": "", "nll_loss": "",
-                                "g_loss": "", "d_weight": "",
-                                "logits_real": "", "logits_fake": "", "r1_penalty": "", "r1_effective_weight": "",
-                                "nll_grads_norm": "", "g_grads_norm": "",
-                                "psnr": "", "lpips": "",
-                                "psnr_ema": "", "lpips_ema": "",
-                            })
-                            csv_file.flush()
-                        except Exception:
-                            pass
-
-            # --- Auto discriminator refresh (staleness detection) ---
-            if (
-                args.disc_auto_refresh
-                and current_step >= disc.module.discriminator_iter_start
-                and len(disc_loss_buffer) >= args.disc_stale_window
-            ):
-                cooldown_ok = (
-                    last_disc_refresh_step is None
-                    or (current_step - last_disc_refresh_step) >= args.disc_auto_refresh_cooldown
-                )
-                if cooldown_ok:
-                    import statistics
-                    buf_mean = statistics.mean(disc_loss_buffer)
-                    buf_std = statistics.pstdev(disc_loss_buffer)
-                    if buf_mean > args.disc_stale_loss_threshold and buf_std < args.disc_stale_std_threshold:
-                        disc.module.discriminator.apply(weights_init)
-                        # Broadcast rank 0 weights to all ranks to keep DDP in sync
-                        for param in disc.module.discriminator.parameters():
-                            dist.broadcast(param.data, src=0)
-                        disc_optimizer = torch.optim.AdamW(
-                            filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()),
-                            lr=disc_lr, weight_decay=args.weight_decay,
-                        )
-                        last_disc_refresh_step = current_step
-                        disc_loss_buffer.clear()
-                        if global_rank == 0:
-                            logger.info(
-                                f"[Auto Disc Refresh] Staleness detected at step {current_step}: "
-                                f"mean={buf_mean:.4f}, std={buf_std:.4f}. "
-                                f"Warmup for {args.disc_refresh_warmup} steps."
-                            )
-                            if csv_writer is not None:
-                                try:
-                                    csv_writer.writerow({
-                                        "step": current_step,
-                                        "generator_loss": "DISC_AUTO_REFRESH",
-                                        "discriminator_loss": "", "rec_loss": "",
-                                        "perceptual_loss": "", "kl_loss": "",
-                                        "wavelet_loss": "", "logvar": "", "nll_loss": "",
-                                        "g_loss": "", "d_weight": "",
-                                        "logits_real": "", "logits_fake": "", "r1_penalty": "", "r1_effective_weight": "",
-                                        "nll_grads_norm": "", "g_grads_norm": "",
-                                        "psnr": "", "lpips": "",
-                                        "psnr_ema": "", "lpips_ema": "",
-                                    })
-                                    csv_file.flush()
-                                except Exception:
-                                    pass
-
             # --- Select generator or discriminator step ---
-            in_disc_warmup = (
-                last_disc_refresh_step is not None
-                and (current_step - last_disc_refresh_step) < args.disc_refresh_warmup
-            )
-
-            if in_disc_warmup:
-                # Warmup: only train discriminator after refresh
-                set_modules_requires_grad(modules_to_train, False)
-                disc.module.discriminator.requires_grad_(True)
-                step_gen = False
-                step_dis = True
-            elif (
+            if (
                 current_step % 2 == 1
                 and current_step >= disc.module.discriminator_iter_start
             ):
@@ -1337,14 +829,11 @@ def train(args):
                             "perceptual_loss": _to_csv_scalar(g_log.get('train/p_loss')),
                             "kl_loss": _to_csv_scalar(g_log.get('train/kl_loss')),
                             "wavelet_loss": _to_csv_scalar(g_log.get('train/wl_loss')),
-                            "logvar": _to_csv_scalar(g_log.get('train/logvar')),
                             "nll_loss": _to_csv_scalar(g_log.get('train/nll_loss')),
                             "g_loss": _to_csv_scalar(g_log.get('train/g_loss')),
                             "d_weight": _to_csv_scalar(g_log.get('train/d_weight')),
                             "logits_real": "",
                             "logits_fake": "",
-                            "r1_penalty": "",
-                            "r1_effective_weight": "",
                             "nll_grads_norm": _to_csv_scalar(g_log.get('train/nll_grads_norm')),
                             "g_grads_norm": _to_csv_scalar(g_log.get('train/g_grads_norm')),
                             "psnr": "",
@@ -1375,11 +864,6 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_(disc.module.discriminator.parameters(), args.clip_grad_norm)
                 scaler.step(disc_optimizer)
                 scaler.update()
-                if args.disc_auto_refresh:
-                    # Use globally averaged loss so staleness detection is consistent across ranks
-                    d_loss_avg = d_loss.detach().clone()
-                    dist.all_reduce(d_loss_avg, op=dist.ReduceOp.AVG)
-                    disc_loss_buffer.append(d_loss_avg.item())
                 if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
                     wandb.log(
                         {"train/discriminator_loss": d_loss.item()}, step=current_step
@@ -1399,14 +883,11 @@ def train(args):
                             "perceptual_loss": "",
                             "kl_loss": "",
                             "wavelet_loss": "",
-                            "logvar": "",
                             "nll_loss": "",
                             "g_loss": "",
                             "d_weight": "",
                             "logits_real": _to_csv_scalar(d_log.get('train/logits_real')),
                             "logits_fake": _to_csv_scalar(d_log.get('train/logits_fake')),
-                            "r1_penalty": _to_csv_scalar(d_log.get('train/r1_penalty')),
-                            "r1_effective_weight": _to_csv_scalar(d_log.get('train/r1_effective_weight')),
                             "nll_grads_norm": "",
                             "g_grads_norm": "",
                             "psnr": "",
@@ -1426,35 +907,26 @@ def train(args):
             def valid_model(model, name=""):
                 nonlocal csv_warned_ema_legacy
                 set_eval(modules_to_train)
-                discriminator = disc.module.discriminator
-                was_disc_training = discriminator.training
-                discriminator.eval()
                 try:
                     (
                         psnr_list,
                         lpips_list,
                         orig_images,
                         recon_images,
-                        patch_records,
                         logged_sample_indices,
                     ) = valid(
-                        global_rank, rank, model, discriminator, val_dataloader, precision, args,
+                        global_rank, rank, model, val_dataloader, precision, args,
                         lpips_model=val_lpips_model
                     )
-                    valid_psnr, valid_lpips, valid_orig_images, valid_recon_images, valid_patch_records = gather_valid_result(
-                        psnr_list, lpips_list, orig_images, recon_images, patch_records, rank, dist.get_world_size()
+                    valid_psnr, valid_lpips, valid_orig_images, valid_recon_images = gather_valid_result(
+                        psnr_list, lpips_list, orig_images, recon_images, rank, dist.get_world_size()
                     )
                 finally:
                     set_train(modules_to_train)
-                    discriminator.train(was_disc_training)
 
                 if global_rank == 0:
                     is_ema = name == "ema"
                     name = "_" + name if name != "" else name
-                    shared_sample_indices = [int(i) for i in logged_sample_indices[:args.eval_num_image_log]]
-
-                    patch_score_dir = ckpt_dir / "val_patch_scores" / f"step_{current_step:08d}{name}"
-                    recon_image_by_sample_idx = {}
 
                     # Create separate directories for original and reconstructed images
                     if len(valid_orig_images) > 0:
@@ -1465,6 +937,7 @@ def train(args):
                         recon_dir.mkdir(exist_ok=True, parents=True)
 
                         # Save individual images
+                        shared_sample_indices = [int(i) for i in logged_sample_indices[:args.eval_num_image_log]]
                         max_shared = min(
                             args.eval_num_image_log,
                             len(valid_orig_images),
@@ -1475,9 +948,6 @@ def train(args):
                             sample_idx = shared_sample_indices[idx]
                             orig_img = valid_orig_images[idx]
                             recon_img = valid_recon_images[idx]
-                            recon_uint8 = _tensor_image_to_uint8(recon_img)
-                            if recon_uint8 is not None:
-                                recon_image_by_sample_idx[sample_idx] = recon_uint8
                             save_image(
                                 orig_img,
                                 orig_dir / f"step_{current_step}_original{name}_{idx:03d}_sid{sample_idx}.png",
@@ -1499,16 +969,6 @@ def train(args):
                                 step=current_step,
                             )
 
-                    save_patch_scores(
-                        valid_patch_records,
-                        patch_score_dir,
-                        val_dataset=val_dataset,
-                        eval_resolution=args.eval_resolution,
-                        vis_max_samples=args.eval_num_image_log,
-                        selected_sample_indices=shared_sample_indices if len(shared_sample_indices) > 0 else None,
-                        recon_image_by_sample_idx=recon_image_by_sample_idx if len(recon_image_by_sample_idx) > 0 else None,
-                    )
-                    log_patch_scores_to_wandb(valid_patch_records, current_step, f"val{name}", use_wandb=use_wandb)
                     if use_wandb:
                         wandb.log({f"val{name}/psnr": valid_psnr}, step=current_step)
                         wandb.log({f"val{name}/lpips": valid_lpips}, step=current_step)
@@ -1524,10 +984,9 @@ def train(args):
                                 "perceptual_loss": "",
                                 "kl_loss": "",
                                 "wavelet_loss": "",
-                                "logvar": "", "nll_loss": "",
+                                "nll_loss": "",
                                 "g_loss": "", "d_weight": "",
                                 "logits_real": "", "logits_fake": "",
-                                "r1_penalty": "", "r1_effective_weight": "",
                                 "nll_grads_norm": "", "g_grads_norm": "",
                                 "psnr": "",
                                 "lpips": "",
@@ -1557,7 +1016,6 @@ def train(args):
                         except Exception as e:
                             logger.error(f"Failed to write validation metrics to CSV: {e}")
 
-                    logger.info(f"{name} PatchGAN patch scores saved to `{patch_score_dir}` (summary.csv + patch_vis/*.png).")
                     logger.info(f"{name} Validation done.")
 
             if current_step % args.eval_steps == 0 or current_step == 1:
@@ -1595,13 +1053,9 @@ def train(args):
                     },
                     scaler.state_dict(),
                     ddp_sampler.state_dict(),
-                    ckpt_dir,
+                    checkpoint_subdir,
                     f"checkpoint-{current_step}.ckpt",
                     ema_state_dict=ema.shadow if args.ema else None,
-                    disc_refresh_state={
-                        "last_disc_refresh_step": last_disc_refresh_step,
-                        "disc_loss_buffer": list(disc_loss_buffer),
-                    } if args.disc_auto_refresh else None,
                 )
                 logger.info(f"Checkpoint has been saved to `{file_path}`.")
 
@@ -1705,18 +1159,7 @@ def main():
     parser.add_argument("--disc_start", type=int, default=80000, help="step to start discriminator training")
     parser.add_argument("--disc_weight", type=float, default=0.5, help="discriminator loss weight")
     parser.add_argument("--adaptive_weight_clamp", type=float, default=1e5, help="clamp upper bound for adaptive d_weight (default 1e5, lower to reduce disc influence)")
-    parser.add_argument("--r1_weight", type=float, default=0.0, help="R1 gradient penalty weight for discriminator (0=disabled)")
-    parser.add_argument("--r1_start", type=int, default=0, help="Step to start R1 penalty (0=from beginning)")
-    parser.add_argument("--r1_warmup_steps", type=int, default=0, help="Linear warmup steps for R1 weight (0=no warmup, immediate full weight)")
     parser.add_argument("--disc_lr", type=float, default=None, help="discriminator learning rate (default: same as --lr, TTUR recommends 2-4x)")
-    parser.add_argument("--refresh_discriminator", action="store_true", help="reinitialize discriminator weights when resuming from checkpoint")
-    parser.add_argument("--disc_refresh_every", type=int, default=0, help="periodically refresh discriminator every N steps (0=disabled)")
-    parser.add_argument("--disc_refresh_warmup", type=int, default=100, help="after refresh, train only discriminator for N steps")
-    parser.add_argument("--disc_auto_refresh", action="store_true", help="auto-refresh discriminator when disc_loss stagnates at high value")
-    parser.add_argument("--disc_stale_window", type=int, default=500, help="rolling window size (in disc steps) for staleness detection")
-    parser.add_argument("--disc_stale_loss_threshold", type=float, default=0.8, help="mean disc_loss above this is considered 'high'")
-    parser.add_argument("--disc_stale_std_threshold", type=float, default=0.02, help="std below this means loss is flat/stagnant")
-    parser.add_argument("--disc_auto_refresh_cooldown", type=int, default=5000, help="minimum training steps between auto-refreshes")
     parser.add_argument("--kl_weight", type=float, default=1e-06, help="KL divergence weight")
     parser.add_argument("--perceptual_weight", type=float, default=1.0, help="perceptual loss weight")
     parser.add_argument("--loss_type", type=str, default="l1", help="reconstruction loss type")

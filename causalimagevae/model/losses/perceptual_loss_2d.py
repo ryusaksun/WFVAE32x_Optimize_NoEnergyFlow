@@ -55,9 +55,6 @@ class LPIPSWithDiscriminator(nn.Module):
         wavelet_weight=0.01,
         loss_type: str = "l1",
         adaptive_weight_clamp: float = 1e5,
-        r1_weight: float = 0.0,
-        r1_start: int = 0,
-        r1_warmup_steps: int = 0,
     ):
 
         super().__init__()
@@ -80,9 +77,6 @@ class LPIPSWithDiscriminator(nn.Module):
         self.disc_conditional = disc_conditional
         self.loss_func = l1 if loss_type == "l1" else l2
         self.adaptive_weight_clamp = adaptive_weight_clamp
-        self.r1_weight = r1_weight
-        self.r1_start = r1_start
-        self.r1_warmup_steps = r1_warmup_steps
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
         layer = last_layer if last_layer is not None else self.last_layer[0]
@@ -190,48 +184,17 @@ class LPIPSWithDiscriminator(nn.Module):
             return loss, log
 
         if optimizer_idx == 1:  # Discriminator
-            # Compute effective R1 weight with delayed start + linear warmup
-            if self.r1_weight > 0 and global_step >= self.r1_start:
-                if self.r1_warmup_steps > 0 and global_step < self.r1_start + self.r1_warmup_steps:
-                    warmup_progress = (global_step - self.r1_start) / self.r1_warmup_steps
-                    effective_r1 = self.r1_weight * warmup_progress
-                else:
-                    effective_r1 = self.r1_weight
-            else:
-                effective_r1 = 0.0
-
-            real_input = inputs.detach().requires_grad_(effective_r1 > 0)
+            logits_real = self.discriminator(inputs.detach())
             logits_fake = self.discriminator(reconstructions.detach())
-
-            # R1 needs fp32 forward for correct second-order gradients
-            if effective_r1 > 0:
-                with torch.amp.autocast('cuda', enabled=False):
-                    logits_real = self.discriminator(real_input.float())
-            else:
-                logits_real = self.discriminator(real_input)
 
             disc_factor = adopt_weight(
                 self.disc_factor, global_step, threshold=self.discriminator_iter_start
             )
             d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
 
-            # R1 gradient penalty
-            if effective_r1 > 0 and disc_factor > 0:
-                r1_grads = torch.autograd.grad(
-                    outputs=logits_real.sum(),
-                    inputs=real_input,
-                    create_graph=True,
-                )[0]
-                r1_penalty = r1_grads.square().sum([1, 2, 3]).mean()
-                d_loss = d_loss + disc_factor * effective_r1 * r1_penalty
-            else:
-                r1_penalty = torch.tensor(0.0, device=inputs.device)
-
             log = {
                 f"{split}/disc_loss": d_loss.clone().detach().mean(),
                 f"{split}/logits_real": logits_real.detach().mean(),
                 f"{split}/logits_fake": logits_fake.detach().mean(),
-                f"{split}/r1_penalty": r1_penalty.detach().mean(),
-                f"{split}/r1_effective_weight": torch.tensor(effective_r1, device=inputs.device),
             }
             return d_loss, log

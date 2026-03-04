@@ -13,14 +13,21 @@ class EMA:
     def update(self):
         for name, param in self.model.named_parameters():
             if name in self.shadow:
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                shadow = self.shadow[name]
+                if shadow.device != param.device:
+                    shadow = shadow.to(param.device)
+                new_average = (1.0 - self.decay) * param.data + self.decay * shadow
                 self.shadow[name] = new_average.clone()
 
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if name in self.shadow:
                 self.backup[name] = param.data.clone()
-                param.data = self.shadow[name].clone()
+                shadow = self.shadow[name]
+                if shadow.device != param.device:
+                    shadow = shadow.to(param.device)
+                    self.shadow[name] = shadow
+                param.data = shadow.clone()
 
     def restore(self):
         for name, param in self.model.named_parameters():
