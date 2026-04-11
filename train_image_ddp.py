@@ -652,11 +652,22 @@ def train(args):
 
     if args.ema:
         logger.warning(f"Start with EMA. EMA decay = {args.ema_decay}.")
-        ema = EMA(model, args.ema_decay)
+        # Wrap model.module (not the DDP wrapper) so EMA shadow keys match
+        # `gen_model: model.module.state_dict()` and are usable by inference
+        # scripts that load the checkpoint without DDP.
+        ema = EMA(model.module, args.ema_decay)
         ema.register()
         # Restore EMA shadow weights from checkpoint
         if args.resume_from_checkpoint and "ema_state_dict" in checkpoint and checkpoint["ema_state_dict"]:
-            ema.shadow = checkpoint["ema_state_dict"]
+            loaded_shadow = checkpoint["ema_state_dict"]
+            # Backward compat: old checkpoints (pre-fix) wrapped EMA around the
+            # DDP model, so shadow keys had "module." prefix. Strip it so the
+            # keys match model.module.named_parameters().
+            loaded_shadow = {
+                (k[len("module."):] if k.startswith("module.") else k): v
+                for k, v in loaded_shadow.items()
+            }
+            ema.shadow = loaded_shadow
             logger.info("EMA shadow weights restored from checkpoint.")
 
     logger.info("Prepared!")

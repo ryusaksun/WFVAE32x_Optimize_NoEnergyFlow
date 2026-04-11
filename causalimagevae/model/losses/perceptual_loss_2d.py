@@ -149,7 +149,11 @@ class LPIPSWithDiscriminator(nn.Module):
         return torch.stack([p[-1].detach().mean() for p in pred_list]).mean()
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
-        layer = last_layer if last_layer is not None else self.last_layer[0]
+        assert last_layer is not None, (
+            "calculate_adaptive_weight requires an explicit last_layer; "
+            "pass model.module.get_last_layer() from the training loop."
+        )
+        layer = last_layer
 
         nll_grads = torch.autograd.grad(nll_loss, layer, retain_graph=True)[0]
         g_grads = torch.autograd.grad(g_loss, layer, retain_graph=True)[0]

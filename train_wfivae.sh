@@ -121,7 +121,7 @@ ORIGINAL_MANIFEST="${ORIGINAL_MANIFEST:-$DEFAULT_MANIFEST}"
 VAL_MANIFEST="${VAL_MANIFEST-$DEFAULT_VAL_MANIFEST}"
 
 # 输出目录 (默认放在 /mnt/sdb 下，包含项目名以区分实验)
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/hpfs/HDU/ssk/Exp_Output/${PROJECT_NAME}}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdb/ssk/Exp_output/${PROJECT_NAME}}"
 
 # 训练/验证 manifest 路径（预划分模式直接使用用户提供的文件）
 if [ -n "$VAL_MANIFEST" ]; then
@@ -137,7 +137,7 @@ fi
 # 训练/验证步频与日志配置（可通过环境变量覆盖）
 EPOCHS="${EPOCHS:-1000}"
 MAX_STEPS="${MAX_STEPS:-}"
-SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-5000}"
+SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-50000}"
 EVAL_STEPS="${EVAL_STEPS:-1000}"
 EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-30}"     # 验证子集大小，0 表示使用完整验证集
 EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-20}"  # 验证重建图样本数量

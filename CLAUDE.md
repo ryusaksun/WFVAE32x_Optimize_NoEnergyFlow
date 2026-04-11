@@ -310,7 +310,7 @@ Manifest supports field name aliases: `image_path`, `path`, or `target`.
 |----------|---------|-------------|
 | `ORIGINAL_MANIFEST` | `/mnt/hpfs/HDU/ssk/SA-1B_256/train_manifest.jsonl` (256px) or `/mnt/hpfs/HDU/ssk/SA-1B/train_manifest.jsonl` (1024px, **246 server**) | Training JSONL manifest path |
 | `VAL_MANIFEST` | Corresponding `val_manifest.jsonl` next to the training manifest | Pre-split validation manifest (skips auto-split) |
-| `OUTPUT_DIR` | `/mnt/hpfs/HDU/ssk/Exp_Output/{project_name}` | Output directory |
+| `OUTPUT_DIR` | `/mnt/sdb/ssk/Exp_output/{project_name}` | Output directory |
 | `DISABLE_WANDB` | `1` | `1`/`true`/`yes` to disable WandB |
 | `TRAIN_RATIO` | `0.9` | Train/val split ratio (only when no VAL_MANIFEST) |
 
