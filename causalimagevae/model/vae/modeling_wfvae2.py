@@ -1,17 +1,16 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import os
 
 from ..modules import (
-    Downsample,
     ResnetBlock2D,
     Conv2d,
     HaarWaveletTransform2D,
     InverseHaarWaveletTransform2D,
     Normalize,
     nonlinearity,
-    Upsample,
     AttnBlock2D,
     Attention2DFix,
 )
@@ -34,7 +33,7 @@ class WFDownBlock(nn.Module):
         num_res_blocks: int = 2,
         res_block: nn.Module = ResnetBlock2D,
         dropout: float = 0.0,
-        norm_type: str = "layernorm",
+        norm_type: str = "groupnorm",
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -49,12 +48,30 @@ class WFDownBlock(nn.Module):
         self.res_block = nn.Sequential(
             *[res_block(in_channels=in_channels, out_channels=in_channels, dropout=dropout, norm_type=norm_type) for _ in range(num_res_blocks - 1)]
         )
-        self.down = Downsample(in_channels=in_channels, out_channels=in_channels)
-        self.out_res_block = res_block(in_channels=in_channels + energy_flow_size, out_channels=out_channels, dropout=dropout, norm_type=norm_type)
+        self.conv_down = Conv2d(in_channels, out_channels // 4, kernel_size=3, stride=1, padding=1)
+        self.out_res_block = res_block(in_channels=out_channels + energy_flow_size, out_channels=out_channels, dropout=dropout, norm_type=norm_type)
+
+    def _down_shortcut(self, x):
+        """Non-parametric shortcut: [B, in_ch, H, W] → [B, out_ch, H/2, W/2]
+        Space-to-channel (pixel_unshuffle) + channel averaging (DC-AE).
+        Requires 4*in_channels divisible by out_channels.
+        """
+        x = F.pixel_unshuffle(x, 2)  # [B, 4*in_ch, H/2, W/2]
+        B, C, H, W = x.shape
+        out_ch = self.out_channels
+        if C == out_ch:
+            return x
+        elif C > out_ch:
+            return x.reshape(B, out_ch, C // out_ch, H, W).mean(dim=2)
+        else:
+            return x.repeat(1, out_ch // C, 1, 1)
 
     def forward(self, x, w):
         x = self.res_block(x)
-        x = self.down(x)
+        shortcut = self._down_shortcut(x)
+        x = self.conv_down(x)
+        x = F.pixel_unshuffle(x, 2)
+        x = x + shortcut
 
         coeffs = self.wavelet_transform(w[:, :3])
         w = self.in_flow_conv(coeffs)
@@ -73,7 +90,7 @@ class WFUpBlock(nn.Module):
         energy_flow_size: int = 128,
         num_res_blocks: int = 2,
         dropout: float = 0.0,
-        norm_type: str = "layernorm",
+        norm_type: str = "groupnorm",
         res_block: nn.Module = ResnetBlock2D
     ) -> None:
         super().__init__()
@@ -92,8 +109,18 @@ class WFUpBlock(nn.Module):
         self.res_block = nn.Sequential(
             *[res_block(in_channels=in_channels, out_channels=in_channels, dropout=dropout, norm_type=norm_type) for _ in range(num_res_blocks - 2)]
         )
-        self.up = Upsample(in_channels=in_channels, out_channels=in_channels)
-        self.out_res_block = res_block(in_channels=in_channels, out_channels=out_channels, dropout=dropout, norm_type=norm_type)
+        self.conv_up = Conv2d(in_channels, out_channels * 4, kernel_size=3, stride=1, padding=1)
+        self.out_res_block = res_block(in_channels=out_channels, out_channels=out_channels, dropout=dropout, norm_type=norm_type)
+
+    def _up_shortcut(self, x):
+        """Non-parametric shortcut: [B, in_ch, H, W] → [B, out_ch, 2H, 2W]
+        Channel duplicating + pixel_shuffle (DC-AE style).
+        Requires out_channels * 4 divisible by in_channels.
+        """
+        repeats = self.out_channels * 4 // self.in_channels
+        x = x.repeat_interleave(repeats, dim=1)  # [B, out_ch*4, H, W]
+        x = F.pixel_shuffle(x, 2)                 # [B, out_ch, 2H, 2W]
+        return x
 
     def forward(self, x, w=None):
         x = self.branch_conv(x)
@@ -104,7 +131,10 @@ class WFUpBlock(nn.Module):
         w = self.inverse_wavelet_transform(coeffs)
 
         x = self.res_block(x[:, :-self.energy_flow_size])
-        x = self.up(x)
+        shortcut = self._up_shortcut(x)
+        x = self.conv_up(x)
+        x = F.pixel_shuffle(x, 2)
+        x = x + shortcut
 
         return self.out_res_block(x), w, coeffs
 
@@ -115,25 +145,33 @@ class Encoder(VideoBaseAE):
     def __init__(
         self,
         latent_dim: int = 16,
-        num_resblocks: int = 2,
+        num_resblocks: Union[int, List[int]] = 2,
         energy_flow_size: int = 64,
         dropout: float = 0.0,
-        norm_type: str = "layernorm",
+        norm_type: str = "groupnorm",
         base_channels: List[int] = [128, 256, 512],
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
     ) -> None:
         super().__init__()
+        num_down_stages = len(base_channels) - 1
+        if isinstance(num_resblocks, int):
+            num_resblocks = [num_resblocks] * num_down_stages
+        assert len(num_resblocks) == num_down_stages, (
+            f"encoder num_resblocks length {len(num_resblocks)} must match "
+            f"number of down stages {num_down_stages}"
+        )
+
         # 2D Haar: 12 channels (4 coeffs × 3 RGB)
         self.wavelet_transform_in = HaarWaveletTransform2D()
         self.conv_in = Conv2d(12, base_channels[0], kernel_size=3, stride=1, padding=1)
 
         self.down_blocks = nn.ModuleList()
-        for idx in range(len(base_channels) - 1):
+        for idx in range(num_down_stages):
             down_block = WFDownBlock(
                 in_channels=base_channels[idx],
                 out_channels=base_channels[idx+1],
                 energy_flow_size=energy_flow_size,
-                num_res_blocks=num_resblocks,
+                num_res_blocks=num_resblocks[idx],
                 res_block=ResnetBlock2D,
                 dropout=dropout,
                 norm_type=norm_type
@@ -182,15 +220,23 @@ class Decoder(VideoBaseAE):
     def __init__(
         self,
         latent_dim: int = 16,
-        num_resblocks: int = 2,
+        num_resblocks: Union[int, List[int]] = 2,
         dropout: float = 0.0,
         energy_flow_size: int = 128,
-        norm_type: str = "layernorm",
+        norm_type: str = "groupnorm",
         base_channels: List[int] = [128, 256, 512],
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
     ) -> None:
         super().__init__()
         self.energy_flow_size = energy_flow_size
+
+        num_up_stages = len(base_channels) - 1
+        if isinstance(num_resblocks, int):
+            num_resblocks = [num_resblocks] * num_up_stages
+        assert len(num_resblocks) == num_up_stages, (
+            f"decoder num_resblocks length {len(num_resblocks)} must match "
+            f"number of up stages {num_up_stages}"
+        )
 
         self.conv_in = Conv2d(
             latent_dim, base_channels[-1], kernel_size=3, stride=1, padding=1
@@ -213,12 +259,12 @@ class Decoder(VideoBaseAE):
         self.mid = nn.Sequential(*mid_layers)
 
         self.up_blocks = nn.ModuleList()
-        for idx in range(len(base_channels) - 1, 0, -1):
+        for stage_id, idx in enumerate(range(len(base_channels) - 1, 0, -1)):
             up_block = WFUpBlock(
                 in_channels=base_channels[idx],
                 out_channels=base_channels[idx-1],
                 energy_flow_size=energy_flow_size,
-                num_res_blocks=num_resblocks,
+                num_res_blocks=num_resblocks[stage_id],
                 res_block=ResnetBlock2D,
                 dropout=dropout,
                 norm_type=norm_type
@@ -256,12 +302,12 @@ class WFIVAE2Model(VideoBaseAE):
         latent_dim: int = 16,
         base_channels: List[int] = [128, 256, 512],
         decoder_base_channels: Optional[List[int]] = None,
-        encoder_num_resblocks: int = 2,
+        encoder_num_resblocks: Union[int, List[int]] = 2,
         encoder_energy_flow_size: int = 128,
-        decoder_num_resblocks: int = 3,
+        decoder_num_resblocks: Union[int, List[int]] = 3,
         decoder_energy_flow_size: int = 128,
         dropout: float = 0.0,
-        norm_type: str = "layernorm",
+        norm_type: str = "groupnorm",
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
         scale: List[float] = [0.18215] * 16,
         shift: List[float] = [0] * 16,

@@ -124,6 +124,10 @@ class LPIPSWithDiscriminator(nn.Module):
             kl_loss = posteriors.kl()
             kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
 
+            # Per-channel KL for monitoring posterior collapse
+            kl_per_ch = posteriors.kl_per_channel().mean(0)  # [C]
+            active_channels = (kl_per_ch > 0.01).sum().item()
+
             # Wavelet loss for 2D
             if wavelet_coeffs:
                 # wavelet_coeffs = (enc_coeffs, dec_coeffs)
@@ -181,6 +185,8 @@ class LPIPSWithDiscriminator(nn.Module):
             log[f"{split}/g_grads_norm"] = self._last_g_grads_norm
             if self.wavelet_weight > 0:
                 log[f"{split}/wl_loss"] = wl_loss.detach().mean()
+            log[f"{split}/kl_per_channel"] = kl_per_ch.detach().cpu()
+            log[f"{split}/active_channels"] = torch.tensor(active_channels, device=inputs.device)
             return loss, log
 
         if optimizer_idx == 1:  # Discriminator

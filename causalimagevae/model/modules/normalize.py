@@ -33,6 +33,8 @@ def Normalize(in_channels, num_groups=32, norm_type="groupnorm"):
         )
     elif norm_type == "layernorm":
         return LayerNorm(num_channels=in_channels, eps=1e-6)
+    else:
+        raise ValueError(f"Unknown norm_type: {norm_type}. Expected 'groupnorm' or 'layernorm'.")
 
 class ActNorm(nn.Module):
     def __init__(self, num_features, logdet=False, affine=True,

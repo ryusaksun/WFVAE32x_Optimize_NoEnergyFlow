@@ -13,9 +13,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from causalimagevae.model import *
 
 
-def preprocess(image_data: Image.Image, short_size: int = 256, keep_ratio: bool = False) -> torch.Tensor:
+def preprocess(image_data: Image.Image, short_size: int = 256, keep_ratio: bool = False, compression_ratio: int = 8) -> torch.Tensor:
     if keep_ratio:
-        # Keep original aspect ratio, only pad to multiple of 8
+        # Keep original aspect ratio, pad to multiple of compression_ratio
         transform = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -24,8 +24,8 @@ def preprocess(image_data: Image.Image, short_size: int = 256, keep_ratio: bool 
         )
         outputs = transform(image_data).unsqueeze(0)
         _, _, H, W = outputs.shape
-        pad_h = (8 - H % 8) % 8
-        pad_w = (8 - W % 8) % 8
+        pad_h = (compression_ratio - H % compression_ratio) % compression_ratio
+        pad_w = (compression_ratio - W % compression_ratio) % compression_ratio
         if pad_h > 0 or pad_w > 0:
             outputs = torch.nn.functional.pad(outputs, (0, pad_w, 0, pad_h), mode='reflect')
         return outputs, H, W
@@ -59,10 +59,11 @@ def main(args: argparse.Namespace):
             Image.open(args.image_path).convert("RGB"),
             args.short_size,
             keep_ratio=args.keep_ratio,
+            compression_ratio=args.compression_ratio,
         )
         x_vae = x_vae.to(device, dtype=data_type)
 
-        latents = vae.encode(x_vae).latent_dist.sample()
+        latents = vae.encode(x_vae).latent_dist.mode()
         latents = latents.to(data_type)
         image_recon = vae.decode(latents).sample
 
@@ -119,6 +120,12 @@ if __name__ == "__main__":
         "--keep_ratio",
         action="store_true",
         help="Keep original aspect ratio instead of center-cropping to square",
+    )
+    parser.add_argument(
+        "--compression_ratio",
+        type=int,
+        default=32,
+        help="Spatial compression ratio (8 for 8x, 32 for 32x). Determines padding alignment.",
     )
 
     args = parser.parse_args()

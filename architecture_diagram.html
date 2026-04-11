@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WFVAE2 32x DCAEFixed Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --blue: #58a6ff;
+  --purple: #bc8cff;
+  --orange: #f0883e;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --cyan: #39d3ef;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; }
+.header {
+  background: linear-gradient(135deg, #161b22 0%, #1a1f2e 50%, #1e1a2e 100%);
+  border-bottom: 1px solid var(--border); padding: 3rem 2rem; text-align: center;
+}
+.header h1 { font-size: 2.2rem; background: linear-gradient(90deg, var(--purple), var(--cyan)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: .4rem; }
+.header p { color: var(--muted); font-size: 1rem; }
+.nav {
+  display: flex; gap: .5rem; justify-content: center; padding: .8rem 2rem;
+  flex-wrap: wrap; position: sticky; top: 0; z-index: 100;
+  background: rgba(13,17,23,.92); backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+.nav a { color: var(--blue); text-decoration: none; padding: .35rem .7rem; border: 1px solid var(--border); border-radius: 6px; transition: all .2s; font-size: .82rem; }
+.nav a:hover { background: #21262d; border-color: var(--blue); }
+.container { max-width: 1600px; margin: 0 auto; padding: 2rem; }
+.section { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 2rem; overflow: hidden; }
+.section-title { background: #21262d; padding: 1rem 1.5rem; font-size: 1.15rem; color: var(--purple); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: .5rem; }
+.section-body { padding: 1.5rem; overflow-x: auto; }
+.mermaid { display: flex; justify-content: center; background: var(--bg); border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; }
+.badge { font-size: .65rem; padding: 2px 8px; border-radius: 12px; font-weight: 600; }
+.badge-enc { background: #7c3aed; color: #fff; }
+.badge-dec { background: #0e7490; color: #fff; }
+.badge-block { background: #b45309; color: #fff; }
+.badge-ov { background: #da3633; color: #fff; }
+.callout { background: #21262d; border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.2rem; margin-top: 1rem; }
+.callout h4 { color: var(--orange); margin-bottom: .4rem; font-size: .95rem; }
+.callout ul { list-style: none; padding: 0; }
+.callout li { padding: .25rem 0; color: var(--muted); font-size: .88rem; }
+.callout li strong { color: var(--text); }
+.callout li code { background: var(--bg); padding: 1px 5px; border-radius: 3px; color: #79c0ff; font-size: .85em; }
+.dm { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+.dm.r { background: var(--red); } .dm.g { background: var(--green); } .dm.y { background: var(--yellow); } .dm.c { background: var(--cyan); }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.summary-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; text-align: center; }
+.summary-card .label { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+.summary-card .val { font-size: 1.3rem; color: var(--purple); font-weight: 700; margin-top: .3rem; }
+.src-ref { font-size: .75rem; color: var(--muted); font-style: italic; margin-top: .3rem; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>WFVAE2 32x DCAEFixed Architecture</h1>
+  <p>Wavelet Flow VAE &mdash; DCAE-aligned residual shortcuts + Conv&middot;PixelUnshuffle/Shuffle spatial transitions</p>
+</div>
+
+<div class="nav">
+  <a href="#overview">1. Overview</a>
+  <a href="#encoder">2. Encoder</a>
+  <a href="#decoder">3. Decoder</a>
+  <a href="#down-detail">4. WFDownBlock</a>
+  <a href="#up-detail">5. WFUpBlock</a>
+  <a href="#wavelet-flow">6. Wavelet Flow</a>
+</div>
+
+<div class="container">
+
+<!-- ===== 1. OVERVIEW ===== -->
+<div class="section" id="overview">
+<div class="section-title">1. Architecture Overview <span class="badge badge-ov">Overview</span></div>
+<div class="section-body">
+
+<div class="mermaid">
+graph LR
+    subgraph WFVAE2["WFVAE2 32x DCAEFixed"]
+        direction TB
+        I["RGB Input<br/>(B, 3, H, W)"]
+        HWT["HaarWT 2D<br/>3ch &rarr; 12ch, &divide;2"]
+        CI["Conv2d 12 &rarr; 256"]
+        DB["4x WFDownBlock<br/>256 &rarr; 512 &rarr; 512 &rarr; 1024 &rarr; 1024<br/>DCAE residual + Wavelet Flow<br/>num_resblocks = [2, 3, 9, 2]"]
+        MID["Mid Block<br/>ResBlock &rarr; Attention2DFix &rarr; ResBlock"]
+        CO["GN &rarr; Swish &rarr; Conv 1024 &rarr; 128"]
+        Z["z: B, 64, H/32, W/32"]
+        I --> HWT --> CI --> DB --> MID --> CO --> Z
+    end
+
+    subgraph DEC["Decoder"]
+        direction TB
+        ZI["z: B, 64, H/32, W/32"]
+        DCI["Conv2d 64 &rarr; 1024"]
+        DMID["Mid Block<br/>ResBlock &rarr; Attention2DFix &rarr; ResBlock"]
+        UB["4x WFUpBlock<br/>1024 &rarr; 1024 &rarr; 512 &rarr; 512 &rarr; 256<br/>DCAE residual + Wavelet Flow<br/>num_resblocks = [3, 4, 12, 2]"]
+        DCO["GN &rarr; Swish &rarr; Conv 256 &rarr; 12"]
+        MRG["LL += w wavelet residual"]
+        IWT["InvHaarWT 2D<br/>12ch &rarr; 3ch, x2"]
+        OUT["RGB Output<br/>(B, 3, H, W)"]
+        ZI --> DCI --> DMID --> UB --> DCO --> MRG --> IWT --> OUT
+    end
+
+    Z -.->|"sample"| ZI
+
+    style I fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style Z fill:#2d1040,stroke:#bc8cff,color:#fff
+    style ZI fill:#2d1040,stroke:#bc8cff,color:#fff
+    style OUT fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style HWT fill:#3d1a4e,stroke:#d29922,color:#fff
+    style IWT fill:#1a3a4e,stroke:#d29922,color:#fff
+</div>
+
+<div class="summary-grid">
+  <div class="summary-card"><div class="label">Spatial Compression</div><div class="val">32x</div></div>
+  <div class="summary-card"><div class="label">Latent Channels</div><div class="val">64</div></div>
+  <div class="summary-card"><div class="label">Latent 1024px</div><div class="val">64x32x32</div></div>
+  <div class="summary-card"><div class="label">Normalization</div><div class="val">GroupNorm</div></div>
+  <div class="summary-card"><div class="label">Enc ResBlocks</div><div class="val">[2,3,9,2]</div></div>
+  <div class="summary-card"><div class="label">Dec ResBlocks</div><div class="val">[3,4,12,2]</div></div>
+  <div class="summary-card"><div class="label">Params (Enc)</div><div class="val">168.69 M</div></div>
+  <div class="summary-card"><div class="label">Params (Dec)</div><div class="val">309.40 M</div></div>
+  <div class="summary-card"><div class="label">Params (Total)</div><div class="val">478.09 M</div></div>
+  <div class="summary-card"><div class="label">Downsample</div><div class="val">Conv+PixUnshuf</div></div>
+  <div class="summary-card"><div class="label">Upsample</div><div class="val">Conv+PixShuf</div></div>
+</div>
+</div>
+</div>
+
+<!-- ===== 2. ENCODER ===== -->
+<div class="section" id="encoder">
+<div class="section-title">2. Encoder <span class="badge badge-enc">Encoder</span></div>
+<div class="section-body">
+
+<div class="mermaid">
+graph TB
+    IN["Input RGB (B, 3, 1024, 1024)"]
+    HAAR_E["HaarWaveletTransform2D<br/>4 sub-bands LL,LH,HL,HH x 3 RGB = 12ch<br/>(B, 12, 512, 512)"]
+    CI["conv_in: Conv2d 12 &rarr; 256, 3x3, s=1<br/>(B, 256, 512, 512)"]
+    IN --> HAAR_E --> CI
+
+    subgraph WD0["WFDownBlock 0: 512 &rarr; 256, ch 256 &rarr; 512, num_resblocks=2"]
+        WD0R["res_block: ResBlock x1<br/>256 &rarr; 256, GN+Swish<br/>(B, 256, 512, 512)"]
+        WD0SC["DCAE shortcut:<br/>pixel_unshuffle x,2 &rarr; (B, 1024, 256, 256)<br/>reshape B,512,2,H,W .mean dim=2<br/>&rarr; (B, 512, 256, 256)"]
+        WD0CV["conv_down: Conv2d 256 &rarr; 128, 3x3, s=1<br/>(B, 128, 512, 512)"]
+        WD0PU["F.pixel_unshuffle x,2<br/>(B, 512, 256, 256)"]
+        WD0ADD["h + shortcut<br/>(B, 512, 256, 256)"]
+        WD0WT["HaarWT on coeffs0 first3ch LL sub-band<br/>coeffs1: (B, 12, 256, 256)"]
+        WD0FL["in_flow_conv: Conv2d 12 &rarr; 128, 3x3<br/>(B, 128, 256, 256)"]
+        WD0CAT["Concat dim=1: 512 + 128 = 640<br/>(B, 640, 256, 256)"]
+        WD0OUT["out_res_block: ResBlock 640 &rarr; 512, GN+Swish<br/>(B, 512, 256, 256)"]
+    end
+    CI --> WD0R --> WD0SC
+    WD0R --> WD0CV --> WD0PU --> WD0ADD
+    WD0SC -->|"shortcut"| WD0ADD
+    HAAR_E -->|"coeffs0"| WD0WT --> WD0FL
+    WD0ADD --> WD0CAT
+    WD0FL --> WD0CAT
+    WD0CAT --> WD0OUT
+
+    subgraph WD1["WFDownBlock 1: 256 &rarr; 128, ch 512 &rarr; 512, num_resblocks=3"]
+        WD1R["res_block: ResBlock x2<br/>512 &rarr; 512, GN+Swish<br/>(B, 512, 256, 256)"]
+        WD1SC["DCAE shortcut:<br/>pixel_unshuffle &rarr; (B, 2048, 128, 128)<br/>group_avg 4&rarr;1 &rarr; (B, 512, 128, 128)"]
+        WD1CV["conv_down: Conv2d 512 &rarr; 128, 3x3, s=1<br/>(B, 128, 256, 256)"]
+        WD1PU["pixel_unshuffle x,2<br/>(B, 512, 128, 128)"]
+        WD1ADD["h + shortcut<br/>(B, 512, 128, 128)"]
+        WD1WT["HaarWT on coeffs1 first3ch LL<br/>coeffs2: (B, 12, 128, 128)"]
+        WD1FL["in_flow_conv: Conv 12 &rarr; 128<br/>(B, 128, 128, 128)"]
+        WD1CAT["Concat: 512 + 128 = 640<br/>(B, 640, 128, 128)"]
+        WD1OUT["out_res_block: ResBlock 640 &rarr; 512<br/>(B, 512, 128, 128)"]
+    end
+    WD0OUT --> WD1R --> WD1SC
+    WD1R --> WD1CV --> WD1PU --> WD1ADD
+    WD1SC -->|"shortcut"| WD1ADD
+    WD0WT -->|"coeffs1 first3ch"| WD1WT --> WD1FL
+    WD1ADD --> WD1CAT
+    WD1FL --> WD1CAT
+    WD1CAT --> WD1OUT
+
+    subgraph WD2["WFDownBlock 2: 128 &rarr; 64, ch 512 &rarr; 1024, num_resblocks=9 (heavy)"]
+        WD2R["res_block: ResBlock x8<br/>512 &rarr; 512, GN+Swish<br/>(B, 512, 128, 128)"]
+        WD2SC["DCAE shortcut:<br/>pixel_unshuffle &rarr; (B, 2048, 64, 64)<br/>group_avg 2&rarr;1 &rarr; (B, 1024, 64, 64)"]
+        WD2CV["conv_down: Conv2d 512 &rarr; 256, 3x3, s=1<br/>(B, 256, 128, 128)"]
+        WD2PU["pixel_unshuffle x,2<br/>(B, 1024, 64, 64)"]
+        WD2ADD["h + shortcut<br/>(B, 1024, 64, 64)"]
+        WD2WT["HaarWT on coeffs2 first3ch LL<br/>coeffs3: (B, 12, 64, 64)"]
+        WD2FL["in_flow_conv: Conv 12 &rarr; 128<br/>(B, 128, 64, 64)"]
+        WD2CAT["Concat: 1024 + 128 = 1152<br/>(B, 1152, 64, 64)"]
+        WD2OUT["out_res_block: ResBlock 1152 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+    end
+    WD1OUT --> WD2R --> WD2SC
+    WD2R --> WD2CV --> WD2PU --> WD2ADD
+    WD2SC -->|"shortcut"| WD2ADD
+    WD1WT -->|"coeffs2 first3ch"| WD2WT --> WD2FL
+    WD2ADD --> WD2CAT
+    WD2FL --> WD2CAT
+    WD2CAT --> WD2OUT
+
+    subgraph WD3["WFDownBlock 3: 64 &rarr; 32, ch 1024 &rarr; 1024, num_resblocks=2"]
+        WD3R["res_block: ResBlock x1<br/>1024 &rarr; 1024, GN+Swish<br/>(B, 1024, 64, 64)"]
+        WD3SC["DCAE shortcut:<br/>pixel_unshuffle &rarr; (B, 4096, 32, 32)<br/>group_avg 4&rarr;1 &rarr; (B, 1024, 32, 32)"]
+        WD3CV["conv_down: Conv2d 1024 &rarr; 256, 3x3, s=1<br/>(B, 256, 64, 64)"]
+        WD3PU["pixel_unshuffle x,2<br/>(B, 1024, 32, 32)"]
+        WD3ADD["h + shortcut<br/>(B, 1024, 32, 32)"]
+        WD3WT["HaarWT on coeffs3 first3ch LL<br/>coeffs4: (B, 12, 32, 32)"]
+        WD3FL["in_flow_conv: Conv 12 &rarr; 128<br/>(B, 128, 32, 32)"]
+        WD3CAT["Concat: 1024 + 128 = 1152<br/>(B, 1152, 32, 32)"]
+        WD3OUT["out_res_block: ResBlock 1152 &rarr; 1024<br/>(B, 1024, 32, 32)"]
+    end
+    WD2OUT --> WD3R --> WD3SC
+    WD3R --> WD3CV --> WD3PU --> WD3ADD
+    WD3SC -->|"shortcut"| WD3ADD
+    WD2WT -->|"coeffs3 first3ch"| WD3WT --> WD3FL
+    WD3ADD --> WD3CAT
+    WD3FL --> WD3CAT
+    WD3CAT --> WD3OUT
+
+    subgraph MID_E["Mid Block 1024ch"]
+        EM1["ResnetBlock2D 1024 &rarr; 1024, GN+Swish"]
+        EA["Attention2DFix: GN &rarr; QKV 1x1 Conv &rarr; SDPA &rarr; proj_out"]
+        EM2["ResnetBlock2D 1024 &rarr; 1024, GN+Swish"]
+    end
+    WD3OUT --> EM1 --> EA --> EM2
+
+    NORM_E["GroupNorm &rarr; Swish"]
+    CONV_E["Conv2d 1024 &rarr; 128, 3x3"]
+    LAT_E["split &rarr; mu B,64,32,32 + log_var B,64,32,32<br/>z = mu + sigma * eps &rarr; (B, 64, 32, 32)"]
+    EM2 --> NORM_E --> CONV_E --> LAT_E
+
+    style IN fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style LAT_E fill:#2d1040,stroke:#bc8cff,color:#fff
+    style HAAR_E fill:#3d1a4e,stroke:#d29922,color:#fff
+    style EA fill:#2d1f4e,stroke:#d29922,color:#fff
+</div>
+
+<div class="callout">
+<h4>Encoder Key Points</h4>
+<ul>
+<li><span class="dm g"></span><strong>DCAE-aligned spatial transition</strong>: Conv(in, out/4, s=1) + pixel_unshuffle(2). Shortcut: pixel_unshuffle + channel_avg. Both share same spatial rearrangement.</li>
+<li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_down + pixel_unshuffle, matching DC-AE. Wavelet concat + out_res_block are OUTSIDE residual.</li>
+<li><span class="dm y"></span><strong>Cascading wavelet</strong>: Each block takes LL sub-band (first 3ch) of previous coefficients, applies HaarWT to get next-level coefficients.</li>
+<li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>encoder_num_resblocks=[2,3,9,2]</code>, so <code>res_block</code> has <code>num-1</code> ResBlocks before spatial transition, then +1 <code>out_res_block</code> after wavelet concat. Total per stage: 2,3,9,2. Heavy middle at Down2 (9), thin edges at Down0/Down3 (2).</li>
+</ul>
+<p class="src-ref">Source: modeling_wfvae2.py Encoder L142-206, WFDownBlock L25-80</p>
+</div>
+</div>
+</div>
+
+<!-- ===== 3. DECODER ===== -->
+<div class="section" id="decoder">
+<div class="section-title">3. Decoder <span class="badge badge-dec">Decoder</span></div>
+<div class="section-body">
+
+<div class="mermaid">
+graph TB
+    Z_IN["z (B, 64, 32, 32)"]
+    DCI["conv_in: Conv2d 64 &rarr; 1024, 3x3<br/>(B, 1024, 32, 32)"]
+    Z_IN --> DCI
+
+    subgraph MID_D["Mid Block 1024ch"]
+        DM1["ResnetBlock2D 1024, GN+Swish"]
+        DA["Attention2DFix: GN &rarr; QKV &rarr; SDPA &rarr; proj"]
+        DM2["ResnetBlock2D 1024, GN+Swish"]
+    end
+    DCI --> DM1 --> DA --> DM2
+
+    subgraph WU0["WFUpBlock 0: 32 &rarr; 64, ch 1024 &rarr; 1024, num_resblocks=3"]
+        WU0B["branch_conv: ResBlock 1024 &rarr; 1152, GN+Swish<br/>(B, 1152, 32, 32)"]
+        WU0SP["Split: main = x first1024ch, flow = x last128ch"]
+        WU0FC["out_flow_conv:<br/>ResBlock 128 &rarr; 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 32, 32)"]
+        WU0IW["w = None, skip injection<br/>InvHaarWT coeffs &rarr; w0: (B, 3, 64, 64)"]
+        WU0MR["res_block: ResBlock x1<br/>1024 &rarr; 1024, GN+Swish<br/>(B, 1024, 32, 32)"]
+        WU0SC["DCAE shortcut:<br/>repeat_interleave 4 &rarr; (B, 4096, 32, 32)<br/>pixel_shuffle 2 &rarr; (B, 1024, 64, 64)"]
+        WU0CV["conv_up: Conv2d 1024 &rarr; 4096, 3x3, s=1<br/>(B, 4096, 32, 32)"]
+        WU0PS["F.pixel_shuffle x,2<br/>(B, 1024, 64, 64)"]
+        WU0ADD["h + shortcut<br/>(B, 1024, 64, 64)"]
+        WU0OR["out_res_block: ResBlock 1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+    end
+    DM2 --> WU0B --> WU0SP
+    WU0SP -->|"flow 128ch"| WU0FC --> WU0IW
+    WU0SP -->|"main 1024ch"| WU0MR --> WU0SC
+    WU0MR --> WU0CV --> WU0PS --> WU0ADD
+    WU0SC -->|"shortcut"| WU0ADD
+    WU0ADD --> WU0OR
+
+    subgraph WU1["WFUpBlock 1: 64 &rarr; 128, ch 1024 &rarr; 512, num_resblocks=4"]
+        WU1B["branch_conv: ResBlock 1024 &rarr; 1152<br/>(B, 1152, 64, 64)"]
+        WU1SP["Split: main = x first1024ch, flow = x last128ch"]
+        WU1FC["out_flow_conv:<br/>ResBlock 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 64, 64)"]
+        WU1INJ["coeffs first3ch += w0<br/>inject LL sub-band from prev level"]
+        WU1IW["InvHaarWT coeffs &rarr; w1: (B, 3, 128, 128)"]
+        WU1MR["res_block: ResBlock x2<br/>1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+        WU1SC["DCAE shortcut:<br/>repeat_interleave 2 + pixel_shuffle 2<br/>(B, 512, 128, 128)"]
+        WU1CV["conv_up: Conv2d 1024 &rarr; 2048, 3x3, s=1<br/>(B, 2048, 64, 64)"]
+        WU1PS["pixel_shuffle x,2<br/>(B, 512, 128, 128)"]
+        WU1ADD["h + shortcut<br/>(B, 512, 128, 128)"]
+        WU1OR["out_res_block: ResBlock 512 &rarr; 512<br/>(B, 512, 128, 128)"]
+    end
+    WU0OR --> WU1B --> WU1SP
+    WU0IW -->|"w0"| WU1INJ
+    WU1SP -->|"flow 128ch"| WU1FC --> WU1INJ --> WU1IW
+    WU1SP -->|"main 1024ch"| WU1MR --> WU1SC
+    WU1MR --> WU1CV --> WU1PS --> WU1ADD
+    WU1SC -->|"shortcut"| WU1ADD
+    WU1ADD --> WU1OR
+
+    subgraph WU2["WFUpBlock 2: 128 &rarr; 256, ch 512 &rarr; 512, num_resblocks=12 (heavy)"]
+        WU2B["branch_conv: ResBlock 512 &rarr; 640<br/>(B, 640, 128, 128)"]
+        WU2SP["Split: main = x first512ch, flow = x last128ch"]
+        WU2FC["out_flow_conv:<br/>ResBlock 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 128, 128)"]
+        WU2INJ["coeffs first3ch += w1"]
+        WU2IW["InvHaarWT coeffs &rarr; w2: (B, 3, 256, 256)"]
+        WU2MR["res_block: ResBlock x10<br/>512 &rarr; 512<br/>(B, 512, 128, 128)"]
+        WU2SC["DCAE shortcut:<br/>repeat_interleave 4 + pixel_shuffle 2<br/>(B, 512, 256, 256)"]
+        WU2CV["conv_up: Conv2d 512 &rarr; 2048, 3x3, s=1<br/>(B, 2048, 128, 128)"]
+        WU2PS["pixel_shuffle x,2<br/>(B, 512, 256, 256)"]
+        WU2ADD["h + shortcut<br/>(B, 512, 256, 256)"]
+        WU2OR["out_res_block: ResBlock 512 &rarr; 512<br/>(B, 512, 256, 256)"]
+    end
+    WU1OR --> WU2B --> WU2SP
+    WU1IW -->|"w1"| WU2INJ
+    WU2SP -->|"flow 128ch"| WU2FC --> WU2INJ --> WU2IW
+    WU2SP -->|"main 512ch"| WU2MR --> WU2SC
+    WU2MR --> WU2CV --> WU2PS --> WU2ADD
+    WU2SC -->|"shortcut"| WU2ADD
+    WU2ADD --> WU2OR
+
+    subgraph WU3["WFUpBlock 3: 256 &rarr; 512, ch 512 &rarr; 256, num_resblocks=2"]
+        WU3B["branch_conv: ResBlock 512 &rarr; 640<br/>(B, 640, 256, 256)"]
+        WU3SP["Split: main = x first512ch, flow = x last128ch"]
+        WU3FC["out_flow_conv:<br/>ResBlock 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 256, 256)"]
+        WU3INJ["coeffs first3ch += w2"]
+        WU3IW["InvHaarWT coeffs &rarr; w3: (B, 3, 512, 512)"]
+        WU3MR["res_block: empty (num-2=0)<br/>pass-through (B, 512, 256, 256)"]
+        WU3SC["DCAE shortcut:<br/>repeat_interleave 2 + pixel_shuffle 2<br/>(B, 256, 512, 512)"]
+        WU3CV["conv_up: Conv2d 512 &rarr; 1024, 3x3, s=1<br/>(B, 1024, 256, 256)"]
+        WU3PS["pixel_shuffle x,2<br/>(B, 256, 512, 512)"]
+        WU3ADD["h + shortcut<br/>(B, 256, 512, 512)"]
+        WU3OR["out_res_block: ResBlock 256 &rarr; 256<br/>(B, 256, 512, 512)"]
+    end
+    WU2OR --> WU3B --> WU3SP
+    WU2IW -->|"w2"| WU3INJ
+    WU3SP -->|"flow 128ch"| WU3FC --> WU3INJ --> WU3IW
+    WU3SP -->|"main 512ch"| WU3MR --> WU3SC
+    WU3MR --> WU3CV --> WU3PS --> WU3ADD
+    WU3SC -->|"shortcut"| WU3ADD
+    WU3ADD --> WU3OR
+
+    NORM_D["GroupNorm &rarr; Swish"]
+    CONV_D["Conv2d 256 &rarr; 12, 3x3<br/>(B, 12, 512, 512)"]
+    MERGE["h first3ch += w3<br/>inject LL wavelet residual from last WFUpBlock"]
+    INV_HAAR["InverseHaarWaveletTransform2D<br/>12ch &rarr; 3ch, 512 &rarr; 1024"]
+    OUTPUT["Output RGB (B, 3, 1024, 1024)"]
+    WU3OR --> NORM_D --> CONV_D --> MERGE --> INV_HAAR --> OUTPUT
+    WU3IW -->|"w3"| MERGE
+
+    style Z_IN fill:#2d1040,stroke:#bc8cff,color:#fff
+    style OUTPUT fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style INV_HAAR fill:#1a3a4e,stroke:#d29922,color:#fff
+    style DA fill:#2d1f4e,stroke:#d29922,color:#fff
+</div>
+
+<div class="callout">
+<h4>Decoder Key Points</h4>
+<ul>
+<li><span class="dm g"></span><strong>DCAE-aligned spatial transition</strong>: Conv(in, out*4, s=1) + pixel_shuffle(2). Shortcut: repeat_interleave + pixel_shuffle. Both share same spatial rearrangement.</li>
+<li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_up + pixel_shuffle, matching DC-AE. out_res_block is OUTSIDE residual.</li>
+<li><span class="dm y"></span><strong>Cascading wavelet reconstruction</strong>: Each WFUpBlock generates wavelet coefficients, injects previous level LL into current coefficients, then InvHaarWT produces RGB residual <code>w</code> at progressively larger resolutions.</li>
+<li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>decoder_num_resblocks=[3,4,12,2]</code>, so <code>res_block</code> has <code>num-2</code> ResBlocks (1, 2, 10, 0) in main trunk after branch split. Total per stage = num counting branch_conv + res_block + out_res_block. Heavy middle at Up2 (12 blocks).</li>
+<li><span class="dm r"></span><strong>No encoder skip connections</strong>: Decoder is fully independent, all information comes from latent <code>z</code>.</li>
+</ul>
+<p class="src-ref">Source: modeling_wfvae2.py Decoder L209-276, WFUpBlock L82-139</p>
+</div>
+</div>
+</div>
+
+<!-- ===== 4. WFDownBlock DETAIL ===== -->
+<div class="section" id="down-detail">
+<div class="section-title">4. WFDownBlock Internal Detail <span class="badge badge-block">Block Detail</span></div>
+<div class="section-body">
+
+<div class="mermaid">
+graph TB
+    subgraph INPUT["Inputs"]
+        X["x: (B, in_ch, H, W) spatial features"]
+        W["w: (B, 12, H, W) wavelet coefficients from prev level"]
+    end
+
+    subgraph RESBLOCKS["Pre-spatial ResBlocks num_resblocks - 1"]
+        RB["ResBlock x N-1<br/>GroupNorm &rarr; Swish &rarr; Conv in_ch,in_ch,3x3<br/>&rarr; GroupNorm &rarr; Swish &rarr; Conv in_ch,in_ch,3x3<br/>+ identity shortcut<br/>(B, in_ch, H, W)"]
+    end
+    X --> RB
+
+    subgraph DCAE_RES["DCAE Residual Block: wraps spatial transition only"]
+        SC["Shortcut path non-parametric:<br/>pixel_unshuffle x,2 &rarr; (B, 4*in_ch, H/2, W/2)<br/>if 4*in_ch GT out_ch: reshape B,out,K,H,W .mean dim=2<br/>if 4*in_ch LT out_ch: repeat channels<br/>&rarr; (B, out_ch, H/2, W/2)"]
+        MAIN_CV["Main path parametric:<br/>conv_down: Conv2d in_ch &rarr; out_ch/4, 3x3, s=1<br/>(B, out_ch/4, H, W)"]
+        MAIN_PU["pixel_unshuffle x,2<br/>(B, out_ch, H/2, W/2)"]
+        DCAE_ADD["h + shortcut<br/>(B, out_ch, H/2, W/2)"]
+        MAIN_CV --> MAIN_PU --> DCAE_ADD
+        SC -->|"shortcut"| DCAE_ADD
+    end
+    RB --> SC
+    RB --> MAIN_CV
+
+    subgraph WF["Wavelet Energy Flow"]
+        WT["HaarWaveletTransform2D w first3ch<br/>LL sub-band 3ch &rarr; 12ch at H/2<br/>coeffs: (B, 12, H/2, W/2)"]
+        FL["in_flow_conv: Conv2d 12 &rarr; efs, 3x3<br/>(B, efs, H/2, W/2)"]
+    end
+    W --> WT --> FL
+
+    CAT["Concat h, flow dim=1<br/>(B, out_ch + efs, H/2, W/2)"]
+    DCAE_ADD --> CAT
+    FL --> CAT
+
+    OUT_RB["out_res_block: ResBlock out_ch+efs &rarr; out_ch<br/>GN &rarr; Swish &rarr; Conv &rarr; GN &rarr; Swish &rarr; Conv<br/>+ nin_shortcut 1x1 Conv since in != out<br/>(B, out_ch, H/2, W/2)"]
+    CAT --> OUT_RB
+
+    subgraph OUTPUT["Outputs"]
+        HOUT["h: (B, out_ch, H/2, W/2)"]
+        COUT["coeffs: (B, 12, H/2, W/2) passed to next WFDownBlock"]
+    end
+    OUT_RB --> HOUT
+    WT --> COUT
+
+    style SC fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style DCAE_ADD fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style WT fill:#3d1a4e,stroke:#d29922,color:#fff
+    style FL fill:#3d1a4e,stroke:#d29922,color:#fff
+</div>
+
+<div class="callout">
+<h4>WFDownBlock Design</h4>
+<ul>
+<li><span class="dm g"></span><strong>DCAE residual alignment</strong>: Both paths use pixel_unshuffle for spatial rearrangement. Conv operates at ORIGINAL resolution before pixel_unshuffle, seeing full spatial context.</li>
+<li><span class="dm c"></span><strong>Minimal residual scope</strong>: Shortcut wraps ONLY conv_down + pixel_unshuffle. Wavelet concat and out_res_block process shortcut-enhanced features OUTSIDE residual.</li>
+<li><span class="dm y"></span><strong>Wavelet energy flow</strong>: Cascading HaarWT on LL sub-band produces multi-level frequency decomposition. Flow is concatenated not added to main trunk, then fused by out_res_block.</li>
+</ul>
+</div>
+</div>
+</div>
+
+<!-- ===== 5. WFUpBlock DETAIL ===== -->
+<div class="section" id="up-detail">
+<div class="section-title">5. WFUpBlock Internal Detail <span class="badge badge-block">Block Detail</span></div>
+<div class="section-body">
+
+<div class="mermaid">
+graph TB
+    subgraph INPUT["Inputs"]
+        X["x: (B, in_ch, H, W) spatial features"]
+        W["w: (B, 3, 2H, 2W) or None, wavelet residual from prev WFUpBlock"]
+    end
+
+    BRANCH["branch_conv: ResBlock in_ch &rarr; in_ch + efs<br/>GN &rarr; Swish &rarr; Conv &rarr; GN &rarr; Swish &rarr; Conv + nin_shortcut<br/>(B, in_ch + efs, H, W)"]
+    X --> BRANCH
+
+    SPLIT["Split along channel dim"]
+    BRANCH --> SPLIT
+
+    subgraph FLOW["Wavelet Energy Flow Path"]
+        direction TB
+        FLOW_IN["flow = x last efs channels<br/>(B, efs, H, W)"]
+        FLOW_CONV["out_flow_conv:<br/>ResBlock efs &rarr; efs + Conv2d efs &rarr; 12, 3x3<br/>coeffs: (B, 12, H, W)"]
+        INJECT["coeffs first3ch += w<br/>inject previous level LL residual<br/>skip if w is None"]
+        IWT["InverseHaarWaveletTransform2D coeffs<br/>12ch &rarr; 3ch, H &rarr; 2H<br/>w_out: (B, 3, 2H, 2W)"]
+    end
+    SPLIT -->|"last efs channels"| FLOW_IN --> FLOW_CONV --> INJECT --> IWT
+    W -->|"w from prev block"| INJECT
+
+    subgraph MAIN["Main Spatial Path"]
+        direction TB
+        MAIN_IN["main = x first in_ch channels<br/>(B, in_ch, H, W)"]
+        MAIN_RB["res_block: ResBlock x N-2<br/>in_ch &rarr; in_ch, GN+Swish<br/>(B, in_ch, H, W)"]
+
+        subgraph DCAE_RES["DCAE Residual Block"]
+            SC["Shortcut path non-parametric:<br/>repeat_interleave out_ch*4/in_ch<br/>&rarr; (B, out_ch*4, H, W)<br/>pixel_shuffle 2 &rarr; (B, out_ch, 2H, 2W)"]
+            UP_CV["Main path parametric:<br/>conv_up: Conv2d in_ch &rarr; out_ch*4, 3x3, s=1<br/>(B, out_ch*4, H, W)"]
+            UP_PS["pixel_shuffle x,2<br/>(B, out_ch, 2H, 2W)"]
+            UP_ADD["h + shortcut<br/>(B, out_ch, 2H, 2W)"]
+            UP_CV --> UP_PS --> UP_ADD
+            SC -->|"shortcut"| UP_ADD
+        end
+        MAIN_IN --> MAIN_RB --> SC
+        MAIN_RB --> UP_CV
+    end
+    SPLIT -->|"first in_ch channels"| MAIN_IN
+
+    OUT_RB["out_res_block: ResBlock out_ch &rarr; out_ch<br/>GN &rarr; Swish &rarr; Conv &rarr; GN &rarr; Swish &rarr; Conv + identity shortcut<br/>(B, out_ch, 2H, 2W)"]
+    UP_ADD --> OUT_RB
+
+    subgraph OUTPUT["Outputs"]
+        HOUT["h: (B, out_ch, 2H, 2W)"]
+        WOUT["w: (B, 3, 2H, 2W) passed to next WFUpBlock or final merge"]
+        COEFFOUT["coeffs: (B, 12, H, W) for wavelet loss"]
+    end
+    OUT_RB --> HOUT
+    IWT --> WOUT
+    FLOW_CONV --> COEFFOUT
+
+    style SC fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style UP_ADD fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style FLOW_IN fill:#3d1a4e,stroke:#d29922,color:#fff
+    style FLOW_CONV fill:#3d1a4e,stroke:#d29922,color:#fff
+    style IWT fill:#3d1a4e,stroke:#d29922,color:#fff
+    style INJECT fill:#3d1a4e,stroke:#d29922,color:#fff
+</div>
+
+<div class="callout">
+<h4>WFUpBlock Design</h4>
+<ul>
+<li><span class="dm g"></span><strong>DCAE residual alignment</strong>: Both paths use pixel_shuffle for spatial rearrangement. Addition happens IMMEDIATELY after spatial expansion.</li>
+<li><span class="dm c"></span><strong>Branch-then-split</strong>: <code>branch_conv</code> expands channels to in_ch + efs, then splits. Model learns how to partition information between spatial path and wavelet flow.</li>
+<li><span class="dm y"></span><strong>Cascading wavelet reconstruction</strong>: Each block generates 12-channel wavelet coefficients, injects previous level LL residual <code>w</code> into first 3 channels, then InvHaarWT produces next RGB residual at 2x resolution.</li>
+<li><span class="dm r"></span><strong>out_res_block identity shortcut</strong>: After DCAE addition, in_ch == out_ch for this ResBlock since pixel_shuffle already mapped to out_ch. No channel projection needed.</li>
+</ul>
+</div>
+</div>
+</div>
+
+<!-- ===== 6. WAVELET FLOW ===== -->
+<div class="section" id="wavelet-flow">
+<div class="section-title">6. Wavelet Energy Flow <span class="badge badge-block">Wavelet</span></div>
+<div class="section-body">
+
+<div class="mermaid">
+graph LR
+    subgraph ENC["Encoder: Cascading Haar Decomposition"]
+        direction TB
+        IMG["RGB (B, 3, 1024, 1024)"]
+        C0["HaarWT: coeffs0 (B, 12, 512, 512)<br/>LL 3ch + LH 3ch + HL 3ch + HH 3ch"]
+        D0["WFDownBlock 0: HaarWT coeffs0 first3ch<br/>coeffs1: (B, 12, 256, 256)"]
+        D1["WFDownBlock 1: HaarWT coeffs1 first3ch<br/>coeffs2: (B, 12, 128, 128)"]
+        D2["WFDownBlock 2: HaarWT coeffs2 first3ch<br/>coeffs3: (B, 12, 64, 64)"]
+        D3["WFDownBlock 3: HaarWT coeffs3 first3ch<br/>coeffs4: (B, 12, 32, 32)"]
+        IMG --> C0 --> D0 --> D1 --> D2 --> D3
+    end
+
+    subgraph DEC["Decoder: Cascading InvHaar Reconstruction"]
+        direction TB
+        U0["WFUpBlock 0: gen coeffs (B, 12, 32, 32)<br/>InvHaarWT &rarr; w0: (B, 3, 64, 64)"]
+        U1["WFUpBlock 1: coeffs first3ch += w0<br/>InvHaarWT &rarr; w1: (B, 3, 128, 128)"]
+        U2["WFUpBlock 2: coeffs first3ch += w1<br/>InvHaarWT &rarr; w2: (B, 3, 256, 256)"]
+        U3["WFUpBlock 3: coeffs first3ch += w2<br/>InvHaarWT &rarr; w3: (B, 3, 512, 512)"]
+        FINAL["conv_out first3ch += w3<br/>InvHaarWT &rarr; RGB (B, 3, 1024, 1024)"]
+        U0 --> U1 --> U2 --> U3 --> FINAL
+    end
+
+    subgraph LOSS["Wavelet Loss Training"]
+        direction TB
+        WL["wavelet_loss = L1 encoder_coeffs, decoder_coeffs_reversed<br/>Aligns frequency-domain representations<br/>between encoder and decoder"]
+    end
+
+    D3 -.->|"inter_coeffs"| WL
+    U3 -.->|"inter_coeffs"| WL
+
+    style IMG fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style FINAL fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style C0 fill:#3d1a4e,stroke:#d29922,color:#fff
+    style D0 fill:#3d1a4e,stroke:#d29922,color:#fff
+    style D1 fill:#3d1a4e,stroke:#d29922,color:#fff
+    style D2 fill:#3d1a4e,stroke:#d29922,color:#fff
+    style D3 fill:#3d1a4e,stroke:#d29922,color:#fff
+    style U0 fill:#1a3a4e,stroke:#39d3ef,color:#fff
+    style U1 fill:#1a3a4e,stroke:#39d3ef,color:#fff
+    style U2 fill:#1a3a4e,stroke:#39d3ef,color:#fff
+    style U3 fill:#1a3a4e,stroke:#39d3ef,color:#fff
+    style FINAL fill:#1a3a4e,stroke:#39d3ef,color:#fff
+    style WL fill:#2d1a1a,stroke:#f85149,color:#fff
+</div>
+
+<div class="callout">
+<h4>Wavelet Flow Mechanism</h4>
+<ul>
+<li><span class="dm y"></span><strong>Encoder</strong>: Builds a multi-level Haar wavelet decomposition tree. At each level, takes the LL sub-band first 3 channels = low-frequency RGB approximation and applies another HaarWT. The resulting 12-channel coefficients are (1) processed by <code>in_flow_conv</code> and concatenated to the spatial trunk, and (2) passed to the next level.</li>
+<li><span class="dm c"></span><strong>Decoder</strong>: Reconstructs the wavelet tree in reverse. Each WFUpBlock generates 12-channel coefficients from latent features, injects previous level LL residual <code>w</code>, then InvHaarWT produces 3-channel RGB image at 2x resolution. This <code>w</code> cascades upward until the final output merge.</li>
+<li><span class="dm r"></span><strong>Wavelet loss</strong>: L1 loss between encoder and decoder coefficients reversed order, weight=0.1. Forces decoder to reconstruct frequency-domain structure consistent with encoder decomposition.</li>
+<li><span class="dm g"></span><strong>No skip connections</strong>: Decoder wavelet flow is entirely self-generated from latent. No encoder coefficients are passed to decoder at inference.</li>
+</ul>
+</div>
+</div>
+</div>
+
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    darkMode: true,
+    background: '#0d1117',
+    primaryColor: '#21262d',
+    primaryTextColor: '#c9d1d9',
+    primaryBorderColor: '#30363d',
+    lineColor: '#8b949e',
+    secondaryColor: '#161b22',
+    tertiaryColor: '#21262d',
+    nodeTextColor: '#c9d1d9',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: {
+    htmlLabels: true,
+    curve: 'basis',
+    padding: 15,
+    nodeSpacing: 30,
+    rankSpacing: 40,
+    useMaxWidth: false,
+  },
+  securityLevel: 'loose',
+});
+</script>
+
+</body>
+</html>

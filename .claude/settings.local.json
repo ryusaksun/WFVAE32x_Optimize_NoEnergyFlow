@@ -27,7 +27,24 @@
       "Bash(git status:*)",
       "Bash(ssh:*)",
       "Bash(scp:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(python scripts/test_imagevae.py)",
+      "Bash(python scripts/test_imagevae.py --config examples/wfivae2-image-32x-192bc.json 2>&1)",
+      "Bash(brew install:*)",
+      "Bash(which pdftoppm:*)",
+      "Bash(pdftotext:*)",
+      "Bash(python:*)",
+      "Bash(open:*)",
+      "Bash(playwright install:*)",
+      "Bash(echo \"exit: $?\")",
+      "Read(//private/tmp/**)",
+      "Bash(rmdir /Users/ryuichi/.claude/skills/arch-diagram/scripts /Users/ryuichi/.claude/skills/arch-diagram/references)",
+      "Read(//Users/ryuichi/.claude/skills/arch-diagram/**)",
+      "Read(//Users/ryuichi/.claude/skills/arch-diagram/assets/**)",
+      "Bash(ssh-add:*)",
+      "Bash(kill 53633 53635 55741)",
+      "Bash(kill 55802)",
+      "Bash(ps:*)"
     ]
   }
 }

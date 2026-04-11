@@ -18,7 +18,7 @@ class DiagonalGaussianDistribution(object):
 
     def kl(self, other=None):
         if self.deterministic:
-            return torch.tensor(0., device=self.parameters.device)
+            return torch.zeros(self.mean.shape[0], device=self.parameters.device)
         else:
             if other is None:
                 return 0.5 * torch.sum(torch.pow(self.mean, 2)
@@ -30,9 +30,18 @@ class DiagonalGaussianDistribution(object):
                     + self.var / other.var - 1.0 - self.logvar + other.logvar,
                     dim=list(range(self.mean.ndim))[1:])
 
-    def nll(self, sample, dims=[1,2,3]):
+    def kl_per_channel(self):
+        """KL per channel, summed over spatial dims only. Returns [B, C]."""
         if self.deterministic:
-            return torch.tensor(0., device=self.parameters.device)
+            return torch.zeros(self.mean.shape[:2], device=self.parameters.device)
+        return 0.5 * torch.sum(
+            self.mean ** 2 + self.var - 1.0 - self.logvar,
+            dim=list(range(2, self.mean.ndim))  # sum over spatial dims, keep [B, C]
+        )
+
+    def nll(self, sample):
+        if self.deterministic:
+            return torch.zeros(self.mean.shape[0], device=self.parameters.device)
         logtwopi = np.log(2.0 * np.pi)
         return 0.5 * torch.sum(
             logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,

@@ -122,12 +122,9 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
     if global_rank == 0:
         bar = tqdm.tqdm(total=len(val_dataloader), desc="Validation...")
 
-    psnr_list = []
-    lpips_list = []
-    orig_images = []
-    recon_images = []
-    logged_sample_indices = []
-    num_image_log = args.eval_num_image_log
+    psnr_records = []
+    lpips_records = []
+    image_records = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
@@ -135,71 +132,118 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
             sample_indices = batch.get("index")
             if sample_indices is None:
                 start_idx = batch_idx * inputs.shape[0]
-                sample_indices = list(range(start_idx, start_idx + inputs.shape[0]))
+                dataset_size = len(val_dataloader.dataset)
+                sample_indices = [
+                    global_rank * dataset_size + start_idx + i
+                    for i in range(inputs.shape[0])
+                ]
             elif torch.is_tensor(sample_indices):
                 sample_indices = sample_indices.tolist()
             else:
                 sample_indices = [int(i) for i in sample_indices]
 
             with torch.amp.autocast("cuda", dtype=precision):
-                output = model(inputs)
+                output = model(inputs, sample_posterior=False)
                 image_recon = output.sample
 
-            # Collect images for logging
-            if global_rank == 0:
-                for i in range(len(image_recon)):
-                    if num_image_log <= 0:
-                        break
-                    # Normalize from [-1, 1] to [0, 1], convert to float32 for numpy compatibility
-                    img_orig = ((inputs[i] + 1.0) / 2.0).float().cpu().clamp(0, 1)
-                    img_recon = ((image_recon[i] + 1.0) / 2.0).float().cpu().clamp(0, 1)
-                    orig_images.append(img_orig)
-                    recon_images.append(img_recon)
-                    logged_sample_indices.append(int(sample_indices[i]))
-                    num_image_log -= 1
+            # Only keep a small, globally stable subset of images for logging.
+            for i in range(len(image_recon)):
+                sample_idx = int(sample_indices[i])
+                if 0 <= sample_idx < args.eval_num_image_log:
+                    img_orig = (
+                        ((inputs[i] + 1.0) / 2.0)
+                        .clamp(0, 1)
+                        .mul(255)
+                        .round()
+                        .to(torch.uint8)
+                        .cpu()
+                    )
+                    img_recon = (
+                        ((image_recon[i] + 1.0) / 2.0)
+                        .clamp(0, 1)
+                        .mul(255)
+                        .round()
+                        .to(torch.uint8)
+                        .cpu()
+                    )
+                    image_records.append((sample_idx, img_orig, img_recon))
 
             # Calculate PSNR (data range [-1, 1], so MAX=2)
             mse = torch.mean(torch.square(inputs - image_recon), dim=(1, 2, 3))
-            psnr = 20 * torch.log10(2.0 / torch.sqrt(mse.clamp(min=1e-10)))
-            psnr = psnr.mean().detach().cpu().item()
+            psnr_values = (
+                20 * torch.log10(2.0 / torch.sqrt(mse.clamp(min=1e-10)))
+            ).detach().cpu().tolist()
+            psnr_records.extend(
+                (int(sample_idx), float(psnr_value))
+                for sample_idx, psnr_value in zip(sample_indices, psnr_values)
+            )
 
             # Calculate LPIPS
             if args.eval_lpips:
-                lpips_score = (
+                lpips_scores = (
                     lpips_model.forward(inputs, image_recon)
-                    .mean()
                     .detach()
+                    .reshape(inputs.shape[0], -1)
+                    .mean(dim=1)
                     .cpu()
-                    .item()
+                    .tolist()
                 )
-                lpips_list.append(lpips_score)
-
-            psnr_list.append(psnr)
+                lpips_records.extend(
+                    (int(sample_idx), float(lpips_score))
+                    for sample_idx, lpips_score in zip(sample_indices, lpips_scores)
+                )
 
             if global_rank == 0:
                 bar.update()
 
-    return psnr_list, lpips_list, orig_images, recon_images, logged_sample_indices
+    return psnr_records, lpips_records, image_records
 
-def gather_valid_result(psnr_list, lpips_list, orig_images, recon_images, rank, world_size):
-    gathered_psnr_list = [None for _ in range(world_size)]
-    gathered_lpips_list = [None for _ in range(world_size)]
-    gathered_orig_images = [None for _ in range(world_size)]
-    gathered_recon_images = [None for _ in range(world_size)]
+def gather_valid_result(psnr_records, lpips_records, image_records, global_rank, world_size, num_image_log):
+    gathered_psnr_records = [None for _ in range(world_size)]
+    gathered_lpips_records = [None for _ in range(world_size)]
+    gathered_image_records = [None for _ in range(world_size)] if global_rank == 0 else None
 
-    dist.all_gather_object(gathered_psnr_list, psnr_list)
-    dist.all_gather_object(gathered_lpips_list, lpips_list)
-    dist.all_gather_object(gathered_orig_images, orig_images)
-    dist.all_gather_object(gathered_recon_images, recon_images)
+    dist.all_gather_object(gathered_psnr_records, psnr_records)
+    dist.all_gather_object(gathered_lpips_records, lpips_records)
+    # Skip gather_object for image_records to avoid NCCL OOM on large models.
+    # Only use rank 0's local image_records instead.
 
-    all_psnr = list(chain(*gathered_psnr_list))
-    all_lpips = list(chain(*gathered_lpips_list))
+    all_psnr_records = list(chain(*gathered_psnr_records))
+    all_lpips_records = list(chain(*gathered_lpips_records))
+
+    seen_psnr = set()
+    unique_psnr = []
+    for idx, psnr_value in all_psnr_records:
+        if idx not in seen_psnr:
+            seen_psnr.add(idx)
+            unique_psnr.append(psnr_value)
+
+    seen_lpips = set()
+    unique_lpips = []
+    for idx, lpips_value in all_lpips_records:
+        if idx not in seen_lpips:
+            seen_lpips.add(idx)
+            unique_lpips.append(lpips_value)
+
+    unique_orig, unique_recon, unique_indices = [], [], []
+    if global_rank == 0:
+        seen = set()
+        for idx, orig, recon in sorted(image_records, key=lambda record: record[0]):
+            if idx in seen:
+                continue
+            seen.add(idx)
+            unique_indices.append(idx)
+            unique_orig.append(orig.float().div(255.0))
+            unique_recon.append(recon.float().div(255.0))
+            if len(unique_indices) >= num_image_log:
+                break
 
     return (
-        float(np.mean(all_psnr)) if len(all_psnr) > 0 else float("nan"),
-        float(np.mean(all_lpips)) if len(all_lpips) > 0 else float("nan"),
-        list(chain(*gathered_orig_images)),
-        list(chain(*gathered_recon_images)),
+        float(np.mean(unique_psnr)) if len(unique_psnr) > 0 else float("nan"),
+        float(np.mean(unique_lpips)) if len(unique_lpips) > 0 else float("nan"),
+        unique_orig,
+        unique_recon,
+        unique_indices,
     )
 
 def _to_csv_scalar(value):
@@ -208,7 +252,7 @@ def _to_csv_scalar(value):
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:
             return ""
-        return float(value.detach().mean().item())
+        return float(value.detach().float().mean().item())
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -281,6 +325,7 @@ def plot_training_curves(csv_path, output_path, disc_start=None, smoothing_windo
         ('lpips', 'Validation LPIPS', 'tab:olive'),
         ('psnr_ema', 'Validation PSNR (EMA)', 'tab:pink'),
         ('lpips_ema', 'Validation LPIPS (EMA)', 'tab:gray'),
+        ('active_channels', 'Active Channels (KL>0.01)', 'teal'),
     ]
 
     # Create figure with dynamic subplot layout
@@ -371,7 +416,7 @@ def train(args):
     if global_rank == 0:
         try:
             ckpt_dir.mkdir(exist_ok=False, parents=True)
-        except:
+        except FileExistsError:
             logger.warning(f"`{ckpt_dir}` exists!")
         checkpoint_subdir.mkdir(exist_ok=True)
     dist.barrier()
@@ -515,11 +560,13 @@ def train(args):
         parameters_to_train += list(filter(lambda p: p.requires_grad, module.parameters()))
 
     # logvar controls reconstruction loss scaling — use separate (higher) lr for fast equilibrium
+    aux_gen_params = []
     if disc.module.logvar.requires_grad:
         logvar_lr = args.logvar_lr if args.logvar_lr is not None else args.lr
+        aux_gen_params = [disc.module.logvar]
         gen_param_groups = [
             {"params": parameters_to_train, "lr": args.lr},
-            {"params": [disc.module.logvar], "lr": logvar_lr, "weight_decay": 0.0},
+            {"params": aux_gen_params, "lr": logvar_lr, "weight_decay": 0.0},
         ]
         logger.info(f"learn_logvar enabled: logvar lr={logvar_lr} (init={disc.module.logvar.item():.4f})")
     else:
@@ -554,36 +601,40 @@ def train(args):
         model.module.load_state_dict(checkpoint["state_dict"]["gen_model"], strict=False)
 
         # resume optimizer
-        if not args.not_resume_optimizer:
-            gen_optimizer.load_state_dict(checkpoint["optimizer_state"]["gen_optimizer"])
+        gen_optimizer.load_state_dict(checkpoint["optimizer_state"]["gen_optimizer"])
+        if aux_gen_params and len(gen_optimizer.param_groups) >= 2:
+            gen_optimizer.param_groups[0]["lr"] = args.lr
+            gen_optimizer.param_groups[1]["lr"] = logvar_lr
+            logger.info(
+                f"Overriding resumed generator lr to {args.lr} "
+                f"and logvar lr to {logvar_lr}"
+            )
+        else:
+            for pg in gen_optimizer.param_groups:
+                pg["lr"] = args.lr
+            logger.info(f"Overriding resumed generator lr to {args.lr}")
 
         # resume discriminator
-        if not args.not_resume_discriminator:
-            disc.module.load_state_dict(checkpoint["state_dict"]["dics_model"])
-            if not args.not_resume_optimizer:
-                disc_optimizer.load_state_dict(checkpoint["optimizer_state"]["disc_optimizer"])
-                # Override disc lr if --disc_lr is explicitly set (TTUR), since checkpoint saves the old lr
-                if args.disc_lr is not None:
-                    for pg in disc_optimizer.param_groups:
-                        pg['lr'] = disc_lr
-                    logger.info(f"Overriding resumed discriminator lr to {disc_lr} (TTUR)")
+        disc.module.load_state_dict(checkpoint["state_dict"]["dics_model"])
+        disc_optimizer.load_state_dict(checkpoint["optimizer_state"]["disc_optimizer"])
+        # Override disc lr if --disc_lr is explicitly set (TTUR), since checkpoint saves the old lr
+        if args.disc_lr is not None:
+            for pg in disc_optimizer.param_groups:
+                pg['lr'] = disc_lr
+            logger.info(f"Overriding resumed discriminator lr to {disc_lr} (TTUR)")
 
-        # M3: always restore scaler state on resume (regardless of disc resume flags)
-        if "scaler_state" in checkpoint:
+        # M3: restore scaler state on resume, but only if scaler is enabled
+        # and checkpoint has a non-empty scaler state (empty when saved with bf16/fp32)
+        if "scaler_state" in checkpoint and scaler.is_enabled() and checkpoint["scaler_state"]:
             scaler.load_state_dict(checkpoint["scaler_state"])
 
         # resume data sampler and training progress
-        if not args.not_resume_training_process:
-            ddp_sampler.load_state_dict(checkpoint["sampler_state"])
-            start_epoch = checkpoint["sampler_state"]["epoch"]
-            current_step = checkpoint["current_step"]
-            logger.info(
-                f"Checkpoint loaded from {args.resume_from_checkpoint}, starting from epoch {start_epoch} step {current_step}"
-            )
-        else:
-            logger.info(
-                f"Checkpoint weights loaded from {args.resume_from_checkpoint}, training process reset (epoch=0, step=0)"
-            )
+        ddp_sampler.load_state_dict(checkpoint["sampler_state"])
+        start_epoch = checkpoint["sampler_state"]["epoch"]
+        current_step = checkpoint["current_step"]
+        logger.info(
+            f"Checkpoint loaded from {args.resume_from_checkpoint}, starting from epoch {start_epoch} step {current_step}"
+        )
 
     if args.ema:
         logger.warning(f"Start with EMA. EMA decay = {args.ema_decay}.")
@@ -612,6 +663,7 @@ def train(args):
             "logits_real", "logits_fake",
             "nll_grads_norm", "g_grads_norm",
             "psnr", "lpips", "psnr_ema", "lpips_ema",
+            "active_channels",
         ]
 
         # Check if resuming from checkpoint (fall back to old filename)
@@ -696,26 +748,32 @@ def train(args):
     if args.eval_lpips:
         if lpips is None:
             raise ImportError("lpips is required when --eval_lpips is enabled. Install with: pip install lpips")
-        val_lpips_model = lpips.LPIPS(net="alex", spatial=True)
+        val_lpips_model = lpips.LPIPS(net="alex", spatial=False)
         val_lpips_model.to(rank)
         val_lpips_model = DDP(val_lpips_model, device_ids=[rank])
         val_lpips_model.requires_grad_(False)
         val_lpips_model.eval()
 
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+
     # training bar
     bar_desc = "Epoch: {current_epoch}, Loss: {loss}"
     bar = None
     if global_rank == 0:
+        steps_per_epoch = (
+            len(dataloader) + gradient_accumulation_steps - 1
+        ) // gradient_accumulation_steps
         max_steps = (
-            args.epochs * len(dataloader) if args.max_steps is None else args.max_steps
+            args.epochs * steps_per_epoch if args.max_steps is None else args.max_steps
         )
         bar = tqdm.tqdm(total=max_steps, desc=bar_desc.format(current_epoch=0, loss=0))
         bar.update(current_step)
         logger.warning("Training Details: ")
         logger.warning(f" Max steps: {max_steps}")
         logger.warning(f" Dataset Samples: {len(dataset)}")
+        effective_batch = args.batch_size * int(os.environ['WORLD_SIZE']) * gradient_accumulation_steps
         logger.warning(
-            f" Total Batch Size: {args.batch_size} * {os.environ['WORLD_SIZE']}"
+            f" Total Batch Size: {args.batch_size} * {os.environ['WORLD_SIZE']} * {gradient_accumulation_steps} (accum) = {effective_batch}"
         )
     dist.barrier()
 
@@ -723,11 +781,351 @@ def train(args):
     stop_training = False
     last_gen_csv_logged_step = -args.csv_log_steps
     last_disc_csv_logged_step = -args.csv_log_steps
+    micro_step = 0
+    step_gen = False
+    step_dis = False
+    g_loss = None
+    d_loss = None
+    g_log = {}
+    d_log = {}
+    posterior = None
 
     def update_bar(bar):
         if global_rank == 0:
             bar.desc = bar_desc.format(current_epoch=epoch, loss=f"-")
             bar.update()
+
+    def rescale_optimizer_grads(optimizer, accum_steps):
+        if accum_steps <= 0 or accum_steps == gradient_accumulation_steps:
+            return
+        scale_factor = gradient_accumulation_steps / accum_steps
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                if param.grad is not None:
+                    param.grad.mul_(scale_factor)
+
+    def average_optimizer_grads(optimizer):
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                    param.grad.div_(world_size)
+
+    def average_param_grads(params):
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+        for param in params:
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad.div_(world_size)
+
+    def get_checkpoint_sampler_state(epoch, batch_idx, is_epoch_end):
+        if is_epoch_end:
+            return {
+                "epoch": epoch + 1,
+                "seed": ddp_sampler.seed,
+                "current_index": 0,
+            }
+        next_index = min((batch_idx + 1) * args.batch_size, len(ddp_sampler))
+        return {
+            "epoch": epoch,
+            "seed": ddp_sampler.seed,
+            "current_index": next_index,
+        }
+
+    def run_post_step(epoch, batch_idx, is_epoch_end=False):
+        nonlocal stop_training, csv_warned_ema_legacy
+
+        update_bar(bar)
+
+        # valid model
+        def valid_model(model, name=""):
+            nonlocal csv_warned_ema_legacy
+            set_eval(modules_to_train)
+            try:
+                (
+                    psnr_records,
+                    lpips_records,
+                    image_records,
+                ) = valid(
+                    global_rank, rank, model, val_dataloader, precision, args,
+                    lpips_model=val_lpips_model
+                )
+                valid_psnr, valid_lpips, valid_orig_images, valid_recon_images, logged_sample_indices = gather_valid_result(
+                    psnr_records,
+                    lpips_records,
+                    image_records,
+                    global_rank,
+                    dist.get_world_size(),
+                    args.eval_num_image_log,
+                )
+            finally:
+                set_train(modules_to_train)
+
+            if global_rank == 0:
+                is_ema = name == "ema"
+                name = "_" + name if name != "" else name
+
+                # Create separate directories for original and reconstructed images
+                if len(valid_orig_images) > 0:
+                    # Create directories
+                    orig_dir = ckpt_dir / "val_images" / "original"
+                    recon_dir = ckpt_dir / "val_images" / "reconstructed"
+                    orig_dir.mkdir(exist_ok=True, parents=True)
+                    recon_dir.mkdir(exist_ok=True, parents=True)
+
+                    # Save individual images
+                    shared_sample_indices = [int(i) for i in logged_sample_indices[:args.eval_num_image_log]]
+                    max_shared = min(
+                        args.eval_num_image_log,
+                        len(valid_orig_images),
+                        len(valid_recon_images),
+                        len(shared_sample_indices),
+                    )
+                    for idx in range(max_shared):
+                        sample_idx = shared_sample_indices[idx]
+                        orig_img = valid_orig_images[idx]
+                        recon_img = valid_recon_images[idx]
+                        save_image(
+                            orig_img,
+                            orig_dir / f"step_{current_step}_original{name}_{idx:03d}_sid{sample_idx}.png",
+                        )
+                        save_image(
+                            recon_img,
+                            recon_dir / f"step_{current_step}_recon{name}_{idx:03d}_sid{sample_idx}.png",
+                        )
+
+                    if use_wandb:
+                        # Create grids for wandb logging
+                        orig_grid = make_grid(valid_orig_images[:args.eval_num_image_log], nrow=4)
+                        recon_grid = make_grid(valid_recon_images[:args.eval_num_image_log], nrow=4)
+                        wandb.log(
+                            {
+                                f"val{name}/original": wandb.Image(orig_grid),
+                                f"val{name}/reconstructed": wandb.Image(recon_grid),
+                            },
+                            step=current_step,
+                        )
+
+                if use_wandb:
+                    wandb.log({f"val{name}/psnr": valid_psnr}, step=current_step)
+                    wandb.log({f"val{name}/lpips": valid_lpips}, step=current_step)
+
+                # Log validation metrics to CSV
+                if csv_writer is not None:
+                    try:
+                        val_row = {
+                            "step": current_step,
+                            "generator_loss": "",
+                            "discriminator_loss": "",
+                            "rec_loss": "",
+                            "perceptual_loss": "",
+                            "kl_loss": "",
+                            "wavelet_loss": "",
+                            "nll_loss": "",
+                            "g_loss": "", "d_weight": "",
+                            "logits_real": "", "logits_fake": "",
+                            "nll_grads_norm": "", "g_grads_norm": "",
+                            "psnr": "",
+                            "lpips": "",
+                            "psnr_ema": "",
+                            "lpips_ema": "",
+                            "active_channels": "",
+                        }
+                        should_write_val_row = True
+                        if is_ema:
+                            if csv_supports_ema_columns:
+                                val_row["psnr_ema"] = _to_csv_scalar(valid_psnr)
+                                val_row["lpips_ema"] = _to_csv_scalar(valid_lpips)
+                            else:
+                                should_write_val_row = False
+                                if not csv_warned_ema_legacy:
+                                    logger.warning(
+                                        "Skipped EMA validation CSV row because resumed CSV "
+                                        "does not have `psnr_ema/lpips_ema` columns."
+                                    )
+                                    csv_warned_ema_legacy = True
+                        else:
+                            val_row["psnr"] = _to_csv_scalar(valid_psnr)
+                            val_row["lpips"] = _to_csv_scalar(valid_lpips)
+
+                        if should_write_val_row:
+                            csv_writer.writerow(val_row)
+                            csv_file.flush()
+                    except Exception as e:
+                        logger.error(f"Failed to write validation metrics to CSV: {e}")
+
+                logger.info(f"{name} Validation done.")
+
+        if current_step % args.eval_steps == 0 or current_step == 1:
+            if global_rank == 0:
+                logger.info("Starting validation...")
+            valid_model(model)
+            if args.ema:
+                ema.apply_shadow()
+                try:
+                    valid_model(model, "ema")
+                finally:
+                    ema.restore()
+            if global_rank == 0 and not args.disable_plot:
+                try:
+                    plot_training_curves(
+                        csv_path=ckpt_dir / csv_name,
+                        output_path=ckpt_dir / "training_curves.png",
+                        disc_start=args.disc_start
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to update plot after validation: {e}")
+
+        # save checkpoint
+        if current_step % args.save_ckpt_step == 0 and global_rank == 0:
+            sampler_state = get_checkpoint_sampler_state(
+                epoch=epoch,
+                batch_idx=batch_idx,
+                is_epoch_end=is_epoch_end,
+            )
+            file_path = save_checkpoint(
+                sampler_state["epoch"],
+                current_step,
+                {
+                    "gen_optimizer": gen_optimizer.state_dict(),
+                    "disc_optimizer": disc_optimizer.state_dict(),
+                },
+                {
+                    "gen_model": model.module.state_dict(),
+                    "dics_model": disc.module.state_dict(),
+                },
+                scaler.state_dict(),
+                sampler_state,
+                checkpoint_subdir,
+                f"checkpoint-{current_step}.ckpt",
+                ema_state_dict=ema.shadow if args.ema else None,
+            )
+            logger.info(f"Checkpoint has been saved to `{file_path}`.")
+
+        if args.max_steps is not None and current_step >= args.max_steps:
+            stop_training = True
+            if global_rank == 0:
+                logger.info(f"Reached max_steps={args.max_steps}, stopping training.")
+
+    def finish_accumulation(epoch, accum_steps, batch_idx, is_epoch_end=False):
+        nonlocal current_step, last_gen_csv_logged_step, last_disc_csv_logged_step
+
+        if accum_steps <= 0:
+            return
+
+        current_step += 1
+
+        # --- Optimizer step (after full or partial accumulation) ---
+        if step_gen:
+            scaler.unscale_(gen_optimizer)
+            rescale_optimizer_grads(gen_optimizer, accum_steps)
+            # M4: clip all params in gen_optimizer (model + logvar)
+            all_gen_params = [p for pg in gen_optimizer.param_groups for p in pg["params"]]
+            torch.nn.utils.clip_grad_norm_(all_gen_params, args.clip_grad_norm)
+            _scale_before = scaler.get_scale()
+            scaler.step(gen_optimizer)
+            scaler.update()
+
+            # update ema only if optimizer actually stepped (no inf/nan grads)
+            if args.ema and scaler.get_scale() >= _scale_before:
+                ema.update()
+
+            # log to wandb
+            if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
+                wandb.log(
+                    {"train/generator_loss": g_loss.item()}, step=current_step
+                )
+                wandb.log(
+                    {"train/rec_loss": g_log['train/rec_loss']}, step=current_step
+                )
+                wandb.log(
+                    {"train/latents_std": posterior.mean.detach().std().item()}, step=current_step
+                )
+                wandb.log(
+                    {"train/active_channels": _to_csv_scalar(g_log.get('train/active_channels', 0))}, step=current_step
+                )
+
+            # Log generator-related metrics to CSV
+            if (
+                csv_writer is not None
+                and (current_step - last_gen_csv_logged_step) >= args.csv_log_steps
+            ):
+                try:
+                    csv_writer.writerow({
+                        "step": current_step,
+                        "generator_loss": _to_csv_scalar(g_loss),
+                        "discriminator_loss": "",
+                        "rec_loss": _to_csv_scalar(g_log.get('train/rec_loss')),
+                        "perceptual_loss": _to_csv_scalar(g_log.get('train/p_loss')),
+                        "kl_loss": _to_csv_scalar(g_log.get('train/kl_loss')),
+                        "wavelet_loss": _to_csv_scalar(g_log.get('train/wl_loss')),
+                        "nll_loss": _to_csv_scalar(g_log.get('train/nll_loss')),
+                        "g_loss": _to_csv_scalar(g_log.get('train/g_loss')),
+                        "d_weight": _to_csv_scalar(g_log.get('train/d_weight')),
+                        "logits_real": "",
+                        "logits_fake": "",
+                        "nll_grads_norm": _to_csv_scalar(g_log.get('train/nll_grads_norm')),
+                        "g_grads_norm": _to_csv_scalar(g_log.get('train/g_grads_norm')),
+                        "psnr": "",
+                        "lpips": "",
+                        "psnr_ema": "",
+                        "lpips_ema": "",
+                        "active_channels": _to_csv_scalar(g_log.get('train/active_channels')),
+                    })
+                    csv_file.flush()
+                    last_gen_csv_logged_step = current_step
+                except Exception as e:
+                    logger.error(f"Failed to write generator metrics to CSV: {e}")
+
+        if step_dis:
+            scaler.unscale_(disc_optimizer)
+            rescale_optimizer_grads(disc_optimizer, accum_steps)
+            torch.nn.utils.clip_grad_norm_(disc.module.discriminator.parameters(), args.clip_grad_norm)
+            scaler.step(disc_optimizer)
+            scaler.update()
+            if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
+                wandb.log(
+                    {"train/discriminator_loss": d_loss.item()}, step=current_step
+                )
+
+            # Log discriminator-related metrics to CSV
+            if (
+                csv_writer is not None
+                and (current_step - last_disc_csv_logged_step) >= args.csv_log_steps
+            ):
+                try:
+                    csv_writer.writerow({
+                        "step": current_step,
+                        "generator_loss": "",
+                        "discriminator_loss": _to_csv_scalar(d_log.get('train/disc_loss', d_loss)),
+                        "rec_loss": "",
+                        "perceptual_loss": "",
+                        "kl_loss": "",
+                        "wavelet_loss": "",
+                        "nll_loss": "",
+                        "g_loss": "",
+                        "d_weight": "",
+                        "logits_real": _to_csv_scalar(d_log.get('train/logits_real')),
+                        "logits_fake": _to_csv_scalar(d_log.get('train/logits_fake')),
+                        "nll_grads_norm": "",
+                        "g_grads_norm": "",
+                        "psnr": "",
+                        "lpips": "",
+                        "psnr_ema": "",
+                        "lpips_ema": "",
+                        "active_channels": "",
+                    })
+                    csv_file.flush()
+                    last_disc_csv_logged_step = current_step
+                except Exception as e:
+                    logger.error(f"Failed to write discriminator metrics to CSV: {e}")
+
+        run_post_step(epoch, batch_idx=batch_idx, is_epoch_end=is_epoch_end)
 
     # training Loop
     try:  # M2: try/finally guarantees CSV close on any exception
@@ -747,323 +1145,111 @@ def train(args):
 
             inputs = batch["image"].to(rank)
 
-            # --- Select generator or discriminator step ---
-            if (
-                current_step % 2 == 1
-                and current_step >= disc.module.discriminator_iter_start
-            ):
-                set_modules_requires_grad(modules_to_train, False)
-                disc.module.discriminator.requires_grad_(True)
-                step_gen = False
-                step_dis = True
-            else:
-                set_modules_requires_grad(modules_to_train, True)
-                disc.module.discriminator.requires_grad_(False)
-                step_gen = True
-                step_dis = False
-
-            assert (
-                step_gen or step_dis
-            ), "You should backward either Gen. or Dis. in a step."
-
-            # forward (use no_grad for disc steps to save memory)
-            fwd_ctx = torch.no_grad() if step_dis else nullcontext()
-            with fwd_ctx, torch.amp.autocast('cuda', dtype=precision):
-                outputs = model(inputs)
-                recon = outputs.sample
-                posterior = outputs.latent_dist
-                wavelet_coeffs = None
-                if outputs.extra_output is not None and args.wavelet_loss:
-                    wavelet_coeffs = outputs.extra_output
-
-            # generator loss
-            if step_gen:
-                with torch.amp.autocast('cuda', dtype=precision):
-                    # Use disc.module directly to bypass DDP (no gradient sync needed for disc in gen step)
-                    g_loss, g_log = disc.module(
-                        inputs,
-                        recon,
-                        posterior,
-                        optimizer_idx=0, # 0 - generator
-                        global_step=current_step,
-                        last_layer=model.module.get_last_layer(),
-                        wavelet_coeffs=wavelet_coeffs,
-                        split="train",
-                    )
-                gen_optimizer.zero_grad()
-                scaler.scale(g_loss).backward()
-                scaler.unscale_(gen_optimizer)
-                # M4: clip all params in gen_optimizer (model + logvar)
-                all_gen_params = [p for pg in gen_optimizer.param_groups for p in pg["params"]]
-                torch.nn.utils.clip_grad_norm_(all_gen_params, args.clip_grad_norm)
-                scaler.step(gen_optimizer)
-                scaler.update()
-
-                # update ema
-                if args.ema:
-                    ema.update()
-
-                # log to wandb
-                if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
-                    wandb.log(
-                        {"train/generator_loss": g_loss.item()}, step=current_step
-                    )
-                    wandb.log(
-                        {"train/rec_loss": g_log['train/rec_loss']}, step=current_step
-                    )
-                    wandb.log(
-                        {"train/latents_std": posterior.mean.detach().std().item()}, step=current_step
-                    )
-
-                # Log generator-related metrics to CSV
+            # --- At start of accumulation cycle: select step type and zero grad ---
+            if micro_step == 0:
                 if (
-                    csv_writer is not None
-                    and (current_step - last_gen_csv_logged_step) >= args.csv_log_steps
+                    current_step % 2 == 1
+                    and current_step >= disc.module.discriminator_iter_start
                 ):
-                    try:
-                        csv_writer.writerow({
-                            "step": current_step,
-                            "generator_loss": _to_csv_scalar(g_loss),
-                            "discriminator_loss": "",
-                            "rec_loss": _to_csv_scalar(g_log.get('train/rec_loss')),
-                            "perceptual_loss": _to_csv_scalar(g_log.get('train/p_loss')),
-                            "kl_loss": _to_csv_scalar(g_log.get('train/kl_loss')),
-                            "wavelet_loss": _to_csv_scalar(g_log.get('train/wl_loss')),
-                            "nll_loss": _to_csv_scalar(g_log.get('train/nll_loss')),
-                            "g_loss": _to_csv_scalar(g_log.get('train/g_loss')),
-                            "d_weight": _to_csv_scalar(g_log.get('train/d_weight')),
-                            "logits_real": "",
-                            "logits_fake": "",
-                            "nll_grads_norm": _to_csv_scalar(g_log.get('train/nll_grads_norm')),
-                            "g_grads_norm": _to_csv_scalar(g_log.get('train/g_grads_norm')),
-                            "psnr": "",
-                            "lpips": "",
-                            "psnr_ema": "",
-                            "lpips_ema": "",
-                        })
-                        csv_file.flush()
-                        last_gen_csv_logged_step = current_step
-                    except Exception as e:
-                        logger.error(f"Failed to write generator metrics to CSV: {e}")
+                    set_modules_requires_grad(modules_to_train, False)
+                    disc.module.discriminator.requires_grad_(True)
+                    step_gen = False
+                    step_dis = True
+                else:
+                    set_modules_requires_grad(modules_to_train, True)
+                    disc.module.discriminator.requires_grad_(False)
+                    step_gen = True
+                    step_dis = False
 
-            # discriminator loss
-            if step_dis:
-                with torch.amp.autocast('cuda', dtype=precision):
-                    d_loss, d_log = disc(
-                        inputs,
-                        recon,
-                        posterior,
-                        optimizer_idx=1,
-                        global_step=current_step,
-                        last_layer=None,
-                        split="train",
-                    )
-                disc_optimizer.zero_grad()
-                scaler.scale(d_loss).backward()
-                scaler.unscale_(disc_optimizer)
-                torch.nn.utils.clip_grad_norm_(disc.module.discriminator.parameters(), args.clip_grad_norm)
-                scaler.step(disc_optimizer)
-                scaler.update()
-                if use_wandb and global_rank == 0 and current_step % args.log_steps == 0:
-                    wandb.log(
-                        {"train/discriminator_loss": d_loss.item()}, step=current_step
-                    )
+                assert (
+                    step_gen or step_dis
+                ), "You should backward either Gen. or Dis. in a step."
 
-                # Log discriminator-related metrics to CSV
-                if (
-                    csv_writer is not None
-                    and (current_step - last_disc_csv_logged_step) >= args.csv_log_steps
-                ):
-                    try:
-                        csv_writer.writerow({
-                            "step": current_step,
-                            "generator_loss": "",
-                            "discriminator_loss": _to_csv_scalar(d_log.get('train/disc_loss', d_loss)),
-                            "rec_loss": "",
-                            "perceptual_loss": "",
-                            "kl_loss": "",
-                            "wavelet_loss": "",
-                            "nll_loss": "",
-                            "g_loss": "",
-                            "d_weight": "",
-                            "logits_real": _to_csv_scalar(d_log.get('train/logits_real')),
-                            "logits_fake": _to_csv_scalar(d_log.get('train/logits_fake')),
-                            "nll_grads_norm": "",
-                            "g_grads_norm": "",
-                            "psnr": "",
-                            "lpips": "",
-                            "psnr_ema": "",
-                            "lpips_ema": "",
-                        })
-                        csv_file.flush()
-                        last_disc_csv_logged_step = current_step
-                    except Exception as e:
-                        logger.error(f"Failed to write discriminator metrics to CSV: {e}")
+                if step_gen:
+                    gen_optimizer.zero_grad()
+                if step_dis:
+                    disc_optimizer.zero_grad()
 
-            update_bar(bar)
-            current_step += 1
+            micro_step += 1
+            is_last_micro = (micro_step == gradient_accumulation_steps)
 
-            # valid model
-            def valid_model(model, name=""):
-                nonlocal csv_warned_ema_legacy
-                set_eval(modules_to_train)
-                try:
-                    (
-                        psnr_list,
-                        lpips_list,
-                        orig_images,
-                        recon_images,
-                        logged_sample_indices,
-                    ) = valid(
-                        global_rank, rank, model, val_dataloader, precision, args,
-                        lpips_model=val_lpips_model
-                    )
-                    valid_psnr, valid_lpips, valid_orig_images, valid_recon_images = gather_valid_result(
-                        psnr_list, lpips_list, orig_images, recon_images, rank, dist.get_world_size()
-                    )
-                finally:
-                    set_train(modules_to_train)
+            # DDP gradient sync only on last micro-step
+            sync_ctx = model.no_sync() if (step_gen and not is_last_micro) else nullcontext()
+            disc_sync_ctx = disc.no_sync() if (step_dis and not is_last_micro) else nullcontext()
 
-                if global_rank == 0:
-                    is_ema = name == "ema"
-                    name = "_" + name if name != "" else name
+            with sync_ctx, disc_sync_ctx:
+                # forward (use no_grad for disc steps to save memory)
+                fwd_ctx = torch.no_grad() if step_dis else nullcontext()
+                with fwd_ctx, torch.amp.autocast('cuda', dtype=precision):
+                    outputs = model(inputs)
+                    recon = outputs.sample
+                    posterior = outputs.latent_dist
+                    wavelet_coeffs = None
+                    if outputs.extra_output is not None and args.wavelet_loss:
+                        wavelet_coeffs = outputs.extra_output
 
-                    # Create separate directories for original and reconstructed images
-                    if len(valid_orig_images) > 0:
-                        # Create directories
-                        orig_dir = ckpt_dir / "val_images" / "original"
-                        recon_dir = ckpt_dir / "val_images" / "reconstructed"
-                        orig_dir.mkdir(exist_ok=True, parents=True)
-                        recon_dir.mkdir(exist_ok=True, parents=True)
-
-                        # Save individual images
-                        shared_sample_indices = [int(i) for i in logged_sample_indices[:args.eval_num_image_log]]
-                        max_shared = min(
-                            args.eval_num_image_log,
-                            len(valid_orig_images),
-                            len(valid_recon_images),
-                            len(shared_sample_indices),
+                # generator loss
+                if step_gen:
+                    with torch.amp.autocast('cuda', dtype=precision):
+                        # Use disc.module directly to bypass DDP (no gradient sync needed for disc in gen step)
+                        g_loss, g_log = disc.module(
+                            inputs,
+                            recon,
+                            posterior,
+                            optimizer_idx=0, # 0 - generator
+                            global_step=current_step,
+                            last_layer=model.module.get_last_layer(),
+                            wavelet_coeffs=wavelet_coeffs,
+                            split="train",
                         )
-                        for idx in range(max_shared):
-                            sample_idx = shared_sample_indices[idx]
-                            orig_img = valid_orig_images[idx]
-                            recon_img = valid_recon_images[idx]
-                            save_image(
-                                orig_img,
-                                orig_dir / f"step_{current_step}_original{name}_{idx:03d}_sid{sample_idx}.png",
-                            )
-                            save_image(
-                                recon_img,
-                                recon_dir / f"step_{current_step}_recon{name}_{idx:03d}_sid{sample_idx}.png",
-                            )
+                    scaler.scale(g_loss / gradient_accumulation_steps).backward()
 
-                        if use_wandb:
-                            # Create grids for wandb logging
-                            orig_grid = make_grid(valid_orig_images, nrow=4)
-                            recon_grid = make_grid(valid_recon_images, nrow=4)
-                            wandb.log(
-                                {
-                                    f"val{name}/original": wandb.Image(orig_grid),
-                                    f"val{name}/reconstructed": wandb.Image(recon_grid),
-                                },
-                                step=current_step,
-                            )
-
-                    if use_wandb:
-                        wandb.log({f"val{name}/psnr": valid_psnr}, step=current_step)
-                        wandb.log({f"val{name}/lpips": valid_lpips}, step=current_step)
-
-                    # Log validation metrics to CSV
-                    if csv_writer is not None:
-                        try:
-                            val_row = {
-                                "step": current_step,
-                                "generator_loss": "",
-                                "discriminator_loss": "",
-                                "rec_loss": "",
-                                "perceptual_loss": "",
-                                "kl_loss": "",
-                                "wavelet_loss": "",
-                                "nll_loss": "",
-                                "g_loss": "", "d_weight": "",
-                                "logits_real": "", "logits_fake": "",
-                                "nll_grads_norm": "", "g_grads_norm": "",
-                                "psnr": "",
-                                "lpips": "",
-                                "psnr_ema": "",
-                                "lpips_ema": "",
-                            }
-                            should_write_val_row = True
-                            if is_ema:
-                                if csv_supports_ema_columns:
-                                    val_row["psnr_ema"] = _to_csv_scalar(valid_psnr)
-                                    val_row["lpips_ema"] = _to_csv_scalar(valid_lpips)
-                                else:
-                                    should_write_val_row = False
-                                    if not csv_warned_ema_legacy:
-                                        logger.warning(
-                                            "Skipped EMA validation CSV row because resumed CSV "
-                                            "does not have `psnr_ema/lpips_ema` columns."
-                                        )
-                                        csv_warned_ema_legacy = True
-                            else:
-                                val_row["psnr"] = _to_csv_scalar(valid_psnr)
-                                val_row["lpips"] = _to_csv_scalar(valid_lpips)
-
-                            if should_write_val_row:
-                                csv_writer.writerow(val_row)
-                                csv_file.flush()
-                        except Exception as e:
-                            logger.error(f"Failed to write validation metrics to CSV: {e}")
-
-                    logger.info(f"{name} Validation done.")
-
-            if current_step % args.eval_steps == 0 or current_step == 1:
-                if global_rank == 0:
-                    logger.info("Starting validation...")
-                valid_model(model)
-                if args.ema:
-                    ema.apply_shadow()
-                    try:
-                        valid_model(model, "ema")
-                    finally:
-                        ema.restore()
-                if global_rank == 0 and not args.disable_plot:
-                    try:
-                        plot_training_curves(
-                            csv_path=ckpt_dir / csv_name,
-                            output_path=ckpt_dir / "training_curves.png",
-                            disc_start=args.disc_start
+                # discriminator loss
+                if step_dis:
+                    with torch.amp.autocast('cuda', dtype=precision):
+                        d_loss, d_log = disc(
+                            inputs,
+                            recon,
+                            posterior,
+                            optimizer_idx=1,
+                            global_step=current_step,
+                            last_layer=None,
+                            split="train",
                         )
-                    except Exception as e:
-                        logger.warning(f"Failed to update plot after validation: {e}")
+                    scaler.scale(d_loss / gradient_accumulation_steps).backward()
 
-            # save checkpoint
-            if current_step % args.save_ckpt_step == 0 and global_rank == 0:
-                file_path = save_checkpoint(
-                    epoch,
-                    current_step,
-                    {
-                        "gen_optimizer": gen_optimizer.state_dict(),
-                        "disc_optimizer": disc_optimizer.state_dict(),
-                    },
-                    {
-                        "gen_model": model.module.state_dict(),
-                        "dics_model": disc.module.state_dict(),
-                    },
-                    scaler.state_dict(),
-                    ddp_sampler.state_dict(),
-                    checkpoint_subdir,
-                    f"checkpoint-{current_step}.ckpt",
-                    ema_state_dict=ema.shadow if args.ema else None,
-                )
-                logger.info(f"Checkpoint has been saved to `{file_path}`.")
-
-            if args.max_steps is not None and current_step >= args.max_steps:
-                stop_training = True
-                if global_rank == 0:
-                    logger.info(f"Reached max_steps={args.max_steps}, stopping training.")
+            # Skip to next micro-batch if accumulation not complete
+            if not is_last_micro:
+                continue
+            if step_gen and aux_gen_params:
+                average_param_grads(aux_gen_params)
+            finish_accumulation(
+                epoch,
+                micro_step,
+                batch_idx=batch_idx,
+                is_epoch_end=(batch_idx + 1 == len(dataloader)),
+            )
+            micro_step = 0
+            if stop_training:
                 break
+
+        if micro_step > 0:
+            if global_rank == 0:
+                logger.info(
+                    "Flushing partial gradient accumulation at epoch end: "
+                    f"{micro_step}/{gradient_accumulation_steps} micro-batches."
+                )
+            if step_gen:
+                average_optimizer_grads(gen_optimizer)
+            if step_dis:
+                average_optimizer_grads(disc_optimizer)
+            finish_accumulation(
+                epoch,
+                micro_step,
+                batch_idx=batch_idx,
+                is_epoch_end=True,
+            )
+            micro_step = 0
 
         if stop_training:
             break
@@ -1078,24 +1264,25 @@ def train(args):
                 logger.error(f"Failed to close CSV: {e}")
 
     # end training — cleanup and final plot
-    if global_rank == 0:
-        # Generate final plot (suffix depends on whether interrupted)
-        if not args.disable_plot:
-            try:
-                if _interrupted:
-                    plot_name = f"training_curves_interrupted_step{current_step}.png"
-                else:
-                    plot_name = "training_curves_final.png"
-                logger.info(f"Generating training curves plot: {plot_name}")
-                plot_training_curves(
-                    csv_path=ckpt_dir / csv_name,
-                    output_path=ckpt_dir / plot_name,
-                    disc_start=args.disc_start
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate final plot: {e}")
-
-    dist.destroy_process_group()
+    try:
+        if global_rank == 0:
+            # Generate final plot (suffix depends on whether interrupted)
+            if not args.disable_plot:
+                try:
+                    if _interrupted:
+                        plot_name = f"training_curves_interrupted_step{current_step}.png"
+                    else:
+                        plot_name = "training_curves_final.png"
+                    logger.info(f"Generating training curves plot: {plot_name}")
+                    plot_training_curves(
+                        csv_path=ckpt_dir / csv_name,
+                        output_path=ckpt_dir / plot_name,
+                        disc_start=args.disc_start
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to generate final plot: {e}")
+    finally:
+        dist.destroy_process_group()
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed Image VAE Training")
@@ -1121,6 +1308,7 @@ def main():
     parser.add_argument("--log_steps", type=int, default=5, help="log every N steps")
     parser.add_argument("--freeze_encoder", action="store_true", help="freeze encoder during training")
     parser.add_argument("--clip_grad_norm", type=float, default=1e5, help="gradient clipping norm")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="number of micro-batches to accumulate before optimizer step")
 
     # Data
     parser.add_argument("--image_path", type=str, default=None, help="path to training images or manifest file")
@@ -1135,7 +1323,6 @@ def main():
     )
     parser.add_argument("--model_name", type=str, default=None, help="model name to load from registry")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="path to checkpoint to resume from")
-    parser.add_argument("--not_resume_training_process", action="store_true", help="don't resume training process")
     parser.add_argument("--model_config", type=str, default=None, help="path to model config JSON file")
     parser.add_argument(
         "--mix_precision",
@@ -1145,8 +1332,6 @@ def main():
         help="precision for training",
     )
     parser.add_argument("--wavelet_loss", action="store_true", help="use wavelet loss")
-    parser.add_argument("--not_resume_discriminator", action="store_true", help="don't resume discriminator")
-    parser.add_argument("--not_resume_optimizer", action="store_true", help="don't resume optimizer")
     parser.add_argument("--wavelet_weight", type=float, default=0.1, help="weight for wavelet loss")
 
     # Discriminator Model
@@ -1189,6 +1374,11 @@ def main():
     args = parser.parse_args()
     if args.csv_log_steps <= 0:
         raise ValueError(f"`--csv_log_steps` must be > 0, got {args.csv_log_steps}")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError(
+            "`--gradient_accumulation_steps` must be > 0, "
+            f"got {args.gradient_accumulation_steps}"
+        )
 
     set_random_seed(args.seed)
     train(args)

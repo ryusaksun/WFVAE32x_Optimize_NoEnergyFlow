@@ -25,8 +25,8 @@
 # 6. 指定训练/验证集划分比例（默认 0.9）：
 #    TRAIN_RATIO=0.8 bash train_wfivae.sh
 #
-# 7. 指定分辨率（512 或 1024，默认 1024）：
-#    RESOLUTION=512 bash train_wfivae.sh
+# 7. 指定分辨率（只支持 256 或 1024，默认 256）：
+#    RESOLUTION=1024 bash train_wfivae.sh
 #
 # 8. 覆盖训练步频参数：
 #    EVAL_STEPS=500 SAVE_CKPT_STEP=1000 EPOCHS=500 bash train_wfivae.sh
@@ -46,7 +46,7 @@ set -e  # 遇到错误立即退出
 # ============================================
 
 # 设置GPU (默认使用 GPU 0，可通过 GPU 环境变量覆盖)
-GPU=${GPU:-6}
+GPU=${GPU:-0,1}
 export CUDA_VISIBLE_DEVICES=$GPU
 
 # 计算 GPU 数量 (用于判断是否使用 DDP)
@@ -97,14 +97,31 @@ fi
 # 原始数据清单文件（JSONL格式，支持 image_path/path/target 字段）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_NAME="$(basename "$SCRIPT_DIR")"
-DEFAULT_MANIFEST="/mnt/sdb/kinetics400_frames/train_manifest.jsonl"
+
+# 分辨率配置 (只支持 256 或 1024，默认 256)
+RESOLUTION="${RESOLUTION:-256}"
+if [ "$RESOLUTION" != "256" ] && [ "$RESOLUTION" != "1024" ]; then
+    echo "Error: RESOLUTION 只支持 256 或 1024 (当前: $RESOLUTION)"
+    exit 1
+fi
+
+# 根据分辨率自动选择数据集路径（可通过环境变量覆盖）
+#   256  → SA-1B_256/
+#   1024 → SA-1B/       (原始高分辨率，246 服务器)
+if [ "$RESOLUTION" = "1024" ]; then
+    DEFAULT_MANIFEST="/mnt/hpfs/HDU/ssk/SA-1B/train_manifest.jsonl"
+    DEFAULT_VAL_MANIFEST="/mnt/hpfs/HDU/ssk/SA-1B/val_manifest.jsonl"
+else
+    DEFAULT_MANIFEST="/mnt/hpfs/HDU/ssk/SA-1B_256/train_manifest.jsonl"
+    DEFAULT_VAL_MANIFEST="/mnt/hpfs/HDU/ssk/SA-1B_256/val_manifest.jsonl"
+fi
 ORIGINAL_MANIFEST="${ORIGINAL_MANIFEST:-$DEFAULT_MANIFEST}"
 
-# 验证集清单（如果已预先划分好，直接指定即可跳过自动划分）
-VAL_MANIFEST="${VAL_MANIFEST:-/mnt/sdb/kinetics400_frames/val_manifest.jsonl}"
+# 验证集清单（默认使用预划分的验证集）
+VAL_MANIFEST="${VAL_MANIFEST-$DEFAULT_VAL_MANIFEST}"
 
 # 输出目录 (默认放在 /mnt/sdb 下，包含项目名以区分实验)
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdb/${PROJECT_NAME}}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/hpfs/HDU/ssk/Exp_Output/${PROJECT_NAME}}"
 
 # 训练/验证 manifest 路径（预划分模式直接使用用户提供的文件）
 if [ -n "$VAL_MANIFEST" ]; then
@@ -117,12 +134,10 @@ else
     PRE_SPLIT=0
 fi
 
-# 分辨率配置 (默认 1024)
-RESOLUTION="${RESOLUTION:-256}"
-
 # 训练/验证步频与日志配置（可通过环境变量覆盖）
 EPOCHS="${EPOCHS:-1000}"
-SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-2000}"
+MAX_STEPS="${MAX_STEPS:-}"
+SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-5000}"
 EVAL_STEPS="${EVAL_STEPS:-1000}"
 EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-30}"     # 验证子集大小，0 表示使用完整验证集
 EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-20}"  # 验证重建图样本数量
@@ -130,23 +145,17 @@ CSV_LOG_STEPS="${CSV_LOG_STEPS:-50}"
 LOG_STEPS="${LOG_STEPS:-10}"
 DATASET_NUM_WORKER="${DATASET_NUM_WORKER:-8}"
 
-# 根据分辨率选择默认配置 (EXP_NAME 包含 disc5 标识)
+# 模型配置与 batch size（32x 配置与分辨率解耦，两种分辨率共用同一 config）
+DEFAULT_MODEL_CONFIG="examples/wfivae2-image-32x-192bc.json"
+DEFAULT_EXP_NAME="$PROJECT_NAME"
+
 if [ "$RESOLUTION" = "1024" ]; then
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-192bc.json"
-    DEFAULT_EXP_NAME="$PROJECT_NAME"
     BATCH_SIZE="${BATCH_SIZE:-2}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
-elif [ "$RESOLUTION" = "256" ]; then
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-192bc.json"
-    DEFAULT_EXP_NAME="$PROJECT_NAME"
-    BATCH_SIZE="${BATCH_SIZE:-16}"
-    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 else
-    # 512 或其他分辨率，模型配置通用（无分辨率参数）
-    DEFAULT_MODEL_CONFIG="examples/wfivae2-image-192bc.json"
-    DEFAULT_EXP_NAME="$PROJECT_NAME"
+    # 256
     BATCH_SIZE="${BATCH_SIZE:-8}"
-    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
+    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 fi
 
 MODEL_CONFIG="${MODEL_CONFIG:-$DEFAULT_MODEL_CONFIG}"
@@ -158,8 +167,14 @@ TRAIN_RATIO="${TRAIN_RATIO:-0.9}"
 # Resume设置（可选）
 RESUME_CKPT="${RESUME_CKPT:-}"
 
-# 判别器学习率（默认与生成器一致；TTUR 建议设为 2-4 倍）
-DISC_LR="${DISC_LR:-1e-5}"                             # 判别器学习率，默认与生成器一致(1e-5)
+# 生成器学习率
+LR="${LR:-1e-5}"
+
+# 判别器学习率（默认跟随生成器 LR；TTUR 需要时可单独设 DISC_LR=2e-5）
+DISC_LR="${DISC_LR:-$LR}"
+
+# 梯度累积步数（等效增大 batch size，不增加显存）
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 
 # 自适应权重 clamp 上限（控制判别器对生成器的最大影响力）
 # 默认 1e6（原始值），降低可减少判别器过强导致的伪影
@@ -284,9 +299,15 @@ echo "实验名称: $EXP_NAME"
 echo "分辨率: ${RESOLUTION}x${RESOLUTION}"
 echo "GPU: $GPU ($NUM_GPUS 卡)"
 echo "训练 Epochs: $EPOCHS"
+if [ -n "$MAX_STEPS" ]; then
+    echo "最大训练步数: $MAX_STEPS"
+else
+    echo "最大训练步数: 未设置 (由 EPOCHS 控制)"
+fi
 echo "Checkpoint间隔: $SAVE_CKPT_STEP"
 echo "验证间隔: $EVAL_STEPS"
-echo "学习率: gen=1e-5, disc=$DISC_LR (TTUR)"
+echo "学习率: gen=$LR, disc=$DISC_LR (TTUR)"
+echo "梯度累积: $GRAD_ACCUM_STEPS (等效 batch=$((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM_STEPS)))"
 echo "自适应权重 clamp: $ADAPTIVE_WEIGHT_CLAMP"
 echo "训练精度: $MIX_PRECISION"
 echo "Learn logvar: ${LEARN_LOGVAR:-禁用} (lr=$LOGVAR_LR)"
@@ -306,8 +327,15 @@ echo "架构特点:"
 echo "  - WF-VAE: Wavelet-driven energy Flow VAE"
 echo "  - Multi-level Haar Wavelet Transform"
 echo "  - Energy flow pathway for frequency info"
-echo "  - 压缩比: 8倍"
-LATENT_H=$((RESOLUTION / 8))
+COMPRESSION=$(python3 -c "
+import json
+with open('$MODEL_CONFIG') as f:
+    cfg = json.load(f)
+n_down = len(cfg['base_channels']) - 1
+print(2 ** (n_down + 1))
+")
+echo "  - 压缩比: ${COMPRESSION}倍"
+LATENT_H=$((RESOLUTION / COMPRESSION))
 echo "  - 潜变量: [B, latent_dim, ${LATENT_H}, ${LATENT_H}]"
 echo "================================================"
 
@@ -371,6 +399,11 @@ RESUME_ARGS=()
 if [ -n "$RESUME_CKPT" ]; then
     RESUME_ARGS=(--resume_from_checkpoint "$RESUME_CKPT")
 fi
+if [ -n "$MAX_STEPS" ]; then
+    TRAIN_ARGS_MAX_STEPS=(--max_steps "$MAX_STEPS")
+else
+    TRAIN_ARGS_MAX_STEPS=()
+fi
 
 # 训练参数 (使用数组，安全处理含空格的路径)
 TRAIN_ARGS=(
@@ -384,9 +417,11 @@ TRAIN_ARGS=(
     --ckpt_dir "$OUTPUT_DIR"
     --resolution "$RESOLUTION"
     --batch_size "$BATCH_SIZE"
-    --lr 1e-5
+    --lr "$LR"
+    --gradient_accumulation_steps "$GRAD_ACCUM_STEPS"
     --weight_decay 1e-4
     --epochs "$EPOCHS"
+    "${TRAIN_ARGS_MAX_STEPS[@]}"
     --save_ckpt_step "$SAVE_CKPT_STEP"
     --eval_steps "$EVAL_STEPS"
     --eval_resolution "$RESOLUTION"
