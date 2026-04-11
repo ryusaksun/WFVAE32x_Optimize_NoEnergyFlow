@@ -106,7 +106,7 @@ ax.text(11, 2.0,
         '256px input  |  base_channels = [256, 512, 512, 1024, 1024]  |  latent_dim = 64  |  enc_rb = [2,3,9,2]  |  dec_rb = [3,4,12,2]  |  total params = 478.09 M',
         ha='center', va='center', fontsize=10, color='#757575')
 ax.text(11, 1.2,
-        'DC-AE shortcut: pixel_unshuffle/shuffle + channel avg/dup  (zero parameters)',
+        'DC-AE shortcut (block-level) + I/O shortcut (bottleneck, HunyuanVAE-aligned)  —  all zero parameters',
         ha='center', va='center', fontsize=10, color=C['shortcut'], fontweight='bold')
 
 MX = 6.0;  FX = 16.0
@@ -224,6 +224,7 @@ box(ax, MX, y, BW, BH, 'Attention2DFix (1024)', C['attn'], fs=8.5)
 y -= 1.0
 arr(ax, MX, y+0.7, MX, y+0.45, lw=AW_MAIN)
 box(ax, MX, y, BW, BH, 'ResnetBlock2D (1024)', C['resblock'], fs=8.5)
+mb_em2_y = y  # save EM2 (last mid resblock) output y for I/O shortcut
 mb = y-0.5
 region(ax, MX, (mt+mb)/2, BW+2, mt-mb, 'Encoder Mid', C['bg_mid'], fs=9)
 spatial_label(ax, SX, (mt+mb)/2, '8×8', fs=7.5, color=C['mid'])
@@ -234,7 +235,21 @@ box(ax, MX, y, BW, BH, 'LayerNorm → SiLU', C['norm'], fs=8.5, tc='#333')
 y -= 1.0
 arr(ax, MX, y+0.7, MX, y+0.45, lw=AW_MAIN)
 box(ax, MX, y, BW, BH, 'Conv3×3 (1024 → 128)', C['conv'], fs=8.5)
+# I/O shortcut ⊕ marker on conv_out
+box(ax, MX-BW/2-0.5, y, 0.5, 0.5, '⊕', C['shortcut'], fs=11, tc='white', alpha=0.95)
 dim(ax, MX+DX, y, '[128, 8, 8]  →  split(μ, σ)')
+
+# Encoder I/O shortcut bypass: EM2 output → group_avg → ⊕ (bypasses norm+swish+conv_out)
+io_sc_x = MX - BW/2 - 2.2
+io_sc_y = (mb_em2_y + y) / 2
+box(ax, io_sc_x, io_sc_y, 3.6, 0.7, '_out_shortcut\ngroup_avg (1024→128)', C['shortcut'], fs=7.5, tc='white', alpha=0.95)
+ax.annotate('', xy=(io_sc_x, io_sc_y+0.4), xytext=(MX-BW/2-0.1, mb_em2_y),
+            arrowprops=dict(arrowstyle='->', color=C['shortcut'], lw=1.8,
+                            connectionstyle='arc3,rad=-0.2'), zorder=6)
+ax.annotate('', xy=(MX-BW/2-0.5-0.25, y), xytext=(io_sc_x, io_sc_y-0.4),
+            arrowprops=dict(arrowstyle='->', color=C['shortcut'], lw=1.8,
+                            connectionstyle='arc3,rad=-0.2'), zorder=6)
+note(ax, io_sc_x, io_sc_y-1.0, 'I/O shortcut (non-parametric)', fs=7, color=C['shortcut'])
 
 enc_end = y - 0.7
 region(ax, (MX+FX)/2, (enc_start+enc_end)/2, 24, enc_start-enc_end,
@@ -266,7 +281,21 @@ ax.text(11, no_skip_y,
 y -= 2.5
 arr(ax, 11, y+2.0, MX, y+0.45, lw=AW_MAIN)
 box(ax, MX, y, BW, BH, 'Conv3×3 (64 → 1024)', C['conv'], fs=9)
+# I/O shortcut ⊕ marker on conv_in
+box(ax, MX-BW/2-0.5, y, 0.5, 0.5, '⊕', C['shortcut'], fs=11, tc='white', alpha=0.95)
 dim(ax, MX+DX, y, '[1024, 8, 8]')
+
+# Decoder I/O shortcut bypass: z → repeat_interleave → ⊕
+io_sc_d_x = MX - BW/2 - 2.2
+io_sc_d_y = y + 1.1
+box(ax, io_sc_d_x, io_sc_d_y, 3.6, 0.7, '_in_shortcut\nrepeat_interleave (64→1024)', C['shortcut'], fs=7.5, tc='white', alpha=0.95)
+ax.annotate('', xy=(io_sc_d_x, io_sc_d_y+0.4), xytext=(11-1.5, y+1.85),
+            arrowprops=dict(arrowstyle='->', color=C['shortcut'], lw=1.8,
+                            connectionstyle='arc3,rad=0.2'), zorder=6)
+ax.annotate('', xy=(MX-BW/2-0.5-0.25, y), xytext=(io_sc_d_x, io_sc_d_y-0.4),
+            arrowprops=dict(arrowstyle='->', color=C['shortcut'], lw=1.8,
+                            connectionstyle='arc3,rad=-0.2'), zorder=6)
+note(ax, io_sc_d_x, io_sc_d_y+1.0, 'I/O shortcut (non-parametric)', fs=7, color=C['shortcut'])
 
 # Decoder Mid (1024)
 y -= 1.4

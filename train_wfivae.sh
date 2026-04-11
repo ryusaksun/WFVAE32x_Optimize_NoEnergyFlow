@@ -147,7 +147,7 @@ DATASET_NUM_WORKER="${DATASET_NUM_WORKER:-8}"
 
 # 模型配置与 batch size（32x 配置与分辨率解耦，两种分辨率共用同一 config）
 DEFAULT_MODEL_CONFIG="examples/wfivae2-image-32x-192bc.json"
-DEFAULT_EXP_NAME="$PROJECT_NAME"
+DEFAULT_EXP_NAME="${PROJECT_NAME}_${DISC_TYPE}_${DISC_NORM}"
 
 if [ "$RESOLUTION" = "1024" ]; then
     BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -186,6 +186,19 @@ MIX_PRECISION="${MIX_PRECISION:-bf16}"
 # 学习 logvar（自动平衡重建损失与 GAN 损失的量级）
 LEARN_LOGVAR="${LEARN_LOGVAR:-}"                         # 非空启用，默认关闭
 LOGVAR_LR="${LOGVAR_LR:-1e-2}"                            # logvar 独立学习率（快速找到均衡点）
+
+# ============================================
+# 判别器类型（single / multiscale，pix2pixHD 激进路线）
+# ============================================
+DISC_TYPE="${DISC_TYPE:-multiscale}"            # single | multiscale
+NUM_D="${NUM_D:-3}"                             # 多尺度判别器的尺度数（multiscale 专用）
+N_LAYERS_D="${N_LAYERS_D:-3}"                   # 每个 PatchGAN 的卷积层数
+FEAT_MATCH_WEIGHT="${FEAT_MATCH_WEIGHT:-10.0}"  # pix2pixHD feature-matching loss 权重；0 关闭
+
+# ============================================
+# 判别器归一化（Miyato et al. 2018 Spectral Normalization 等）
+# ============================================
+DISC_NORM="${DISC_NORM:-sn}"                    # sn (默认，谱归一化) | bn (BatchNorm2d) | in (InstanceNorm) | none
 
 # ============================================
 # 创建输出目录
@@ -310,6 +323,12 @@ echo "学习率: gen=$LR, disc=$DISC_LR (TTUR)"
 echo "梯度累积: $GRAD_ACCUM_STEPS (等效 batch=$((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM_STEPS)))"
 echo "自适应权重 clamp: $ADAPTIVE_WEIGHT_CLAMP"
 echo "训练精度: $MIX_PRECISION"
+if [ "$DISC_TYPE" = "multiscale" ]; then
+    echo "判别器: multiscale (num_D=$NUM_D, n_layers=$N_LAYERS_D, feat_match_weight=$FEAT_MATCH_WEIGHT)"
+else
+    echo "判别器: single (原单尺度 PatchGAN)"
+fi
+echo "判别器归一化: $DISC_NORM"
 echo "Learn logvar: ${LEARN_LOGVAR:-禁用} (lr=$LOGVAR_LR)"
 echo "WandB: $WANDB_STATUS"
 if [ "$EVAL_SUBSET_SIZE" = "0" ]; then
@@ -435,6 +454,11 @@ TRAIN_ARGS=(
     --disc_weight 0.5
     --disc_lr "$DISC_LR"
     --adaptive_weight_clamp "$ADAPTIVE_WEIGHT_CLAMP"
+    --disc_type "$DISC_TYPE"
+    --num_D "$NUM_D"
+    --n_layers_D "$N_LAYERS_D"
+    --feat_match_weight "$FEAT_MATCH_WEIGHT"
+    --disc_norm "$DISC_NORM"
     --kl_weight 1e-6
     --perceptual_weight 1.0
     --loss_type l1

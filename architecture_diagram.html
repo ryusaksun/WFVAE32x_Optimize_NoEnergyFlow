@@ -75,6 +75,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <a href="#down-detail">4. WFDownBlock</a>
   <a href="#up-detail">5. WFUpBlock</a>
   <a href="#wavelet-flow">6. Wavelet Flow</a>
+  <a href="#discriminator">7. Discriminator &amp; Loss</a>
 </div>
 
 <div class="container">
@@ -93,15 +94,16 @@ graph LR
         CI["Conv2d 12 &rarr; 256"]
         DB["4x WFDownBlock<br/>256 &rarr; 512 &rarr; 512 &rarr; 1024 &rarr; 1024<br/>DCAE residual + Wavelet Flow<br/>num_resblocks = [2, 3, 9, 2]"]
         MID["Mid Block<br/>ResBlock &rarr; Attention2DFix &rarr; ResBlock"]
-        CO["GN &rarr; Swish &rarr; Conv 1024 &rarr; 128"]
+        CO["GN &rarr; Swish &rarr; Conv 1024 &rarr; 128<br/><b>+ group_avg shortcut (1024→128)</b>"]
         Z["z: B, 64, H/32, W/32"]
         I --> HWT --> CI --> DB --> MID --> CO --> Z
+        MID -.->|"I/O shortcut"| CO
     end
 
     subgraph DEC["Decoder"]
         direction TB
         ZI["z: B, 64, H/32, W/32"]
-        DCI["Conv2d 64 &rarr; 1024"]
+        DCI["Conv2d 64 &rarr; 1024<br/><b>+ repeat_interleave shortcut (64→1024)</b>"]
         DMID["Mid Block<br/>ResBlock &rarr; Attention2DFix &rarr; ResBlock"]
         UB["4x WFUpBlock<br/>1024 &rarr; 1024 &rarr; 512 &rarr; 512 &rarr; 256<br/>DCAE residual + Wavelet Flow<br/>num_resblocks = [3, 4, 12, 2]"]
         DCO["GN &rarr; Swish &rarr; Conv 256 &rarr; 12"]
@@ -109,6 +111,7 @@ graph LR
         IWT["InvHaarWT 2D<br/>12ch &rarr; 3ch, x2"]
         OUT["RGB Output<br/>(B, 3, H, W)"]
         ZI --> DCI --> DMID --> UB --> DCO --> MRG --> IWT --> OUT
+        ZI -.->|"I/O shortcut"| DCI
     end
 
     Z -.->|"sample"| ZI
@@ -131,6 +134,10 @@ graph LR
   <div class="summary-card"><div class="label">Params (Enc)</div><div class="val">168.69 M</div></div>
   <div class="summary-card"><div class="label">Params (Dec)</div><div class="val">309.40 M</div></div>
   <div class="summary-card"><div class="label">Params (Total)</div><div class="val">478.09 M</div></div>
+  <div class="summary-card"><div class="label">I/O Shortcut</div><div class="val">Enabled</div></div>
+  <div class="summary-card"><div class="label">Discriminator</div><div class="val">Multi-scale (num_D=3)</div></div>
+  <div class="summary-card"><div class="label">Disc Params</div><div class="val">8.30 M</div></div>
+  <div class="summary-card"><div class="label">Feat Match λ</div><div class="val">10.0</div></div>
   <div class="summary-card"><div class="label">Downsample</div><div class="val">Conv+PixUnshuf</div></div>
   <div class="summary-card"><div class="label">Upsample</div><div class="val">Conv+PixShuf</div></div>
 </div>
@@ -232,15 +239,24 @@ graph TB
     end
     WD3OUT --> EM1 --> EA --> EM2
 
-    NORM_E["GroupNorm &rarr; Swish"]
-    CONV_E["Conv2d 1024 &rarr; 128, 3x3"]
+    subgraph OUT_IO["Encoder Output + I/O Shortcut"]
+        NORM_E["GroupNorm &rarr; Swish"]
+        CONV_E["Conv2d 1024 &rarr; 128, 3x3<br/>(B, 128, 32, 32)"]
+        SHORTCUT_E["_out_shortcut (non-parametric):<br/>h.reshape(B, 128, 8, 32, 32).mean(dim=2)<br/>(B, 128, 32, 32)"]
+        ADD_E["h + shortcut<br/>(B, 128, 32, 32)"]
+    end
+    EM2 --> NORM_E --> CONV_E --> ADD_E
+    EM2 -->|"group_avg bypass"| SHORTCUT_E --> ADD_E
+
     LAT_E["split &rarr; mu B,64,32,32 + log_var B,64,32,32<br/>z = mu + sigma * eps &rarr; (B, 64, 32, 32)"]
-    EM2 --> NORM_E --> CONV_E --> LAT_E
+    ADD_E --> LAT_E
 
     style IN fill:#2d1f4e,stroke:#bc8cff,color:#fff
     style LAT_E fill:#2d1040,stroke:#bc8cff,color:#fff
     style HAAR_E fill:#3d1a4e,stroke:#d29922,color:#fff
     style EA fill:#2d1f4e,stroke:#d29922,color:#fff
+    style SHORTCUT_E fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style ADD_E fill:#1a2e1a,stroke:#3fb950,color:#fff
 </div>
 
 <div class="callout">
@@ -250,8 +266,9 @@ graph TB
 <li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_down + pixel_unshuffle, matching DC-AE. Wavelet concat + out_res_block are OUTSIDE residual.</li>
 <li><span class="dm y"></span><strong>Cascading wavelet</strong>: Each block takes LL sub-band (first 3ch) of previous coefficients, applies HaarWT to get next-level coefficients.</li>
 <li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>encoder_num_resblocks=[2,3,9,2]</code>, so <code>res_block</code> has <code>num-1</code> ResBlocks before spatial transition, then +1 <code>out_res_block</code> after wavelet concat. Total per stage: 2,3,9,2. Heavy middle at Down2 (9), thin edges at Down0/Down3 (2).</li>
+<li><span class="dm g"></span><strong>I/O shortcut (new)</strong>: Non-parametric group-average shortcut from mid-block output bypasses <code>norm_out → swish → conv_out</code>. Formula: <code>h.reshape(B, 2*latent_dim, C//(2*latent_dim), H, W).mean(dim=2)</code> then added to <code>conv_out</code> result. HunyuanVAE-aligned. Gated by <code>use_io_shortcut=True</code>.</li>
 </ul>
-<p class="src-ref">Source: modeling_wfvae2.py Encoder L142-206, WFDownBlock L25-80</p>
+<p class="src-ref">Source: modeling_wfvae2.py Encoder L142-220, WFDownBlock L25-80</p>
 </div>
 </div>
 </div>
@@ -264,15 +281,21 @@ graph TB
 <div class="mermaid">
 graph TB
     Z_IN["z (B, 64, 32, 32)"]
-    DCI["conv_in: Conv2d 64 &rarr; 1024, 3x3<br/>(B, 1024, 32, 32)"]
-    Z_IN --> DCI
+
+    subgraph IN_IO["Decoder Input + I/O Shortcut"]
+        DCI["conv_in: Conv2d 64 &rarr; 1024, 3x3<br/>(B, 1024, 32, 32)"]
+        SHORTCUT_D["_in_shortcut (non-parametric):<br/>z.repeat_interleave(16, dim=1)<br/>(B, 1024, 32, 32)"]
+        ADD_D["h + shortcut<br/>(B, 1024, 32, 32)"]
+    end
+    Z_IN --> DCI --> ADD_D
+    Z_IN -->|"repeat bypass"| SHORTCUT_D --> ADD_D
 
     subgraph MID_D["Mid Block 1024ch"]
         DM1["ResnetBlock2D 1024, GN+Swish"]
         DA["Attention2DFix: GN &rarr; QKV &rarr; SDPA &rarr; proj"]
         DM2["ResnetBlock2D 1024, GN+Swish"]
     end
-    DCI --> DM1 --> DA --> DM2
+    ADD_D --> DM1 --> DA --> DM2
 
     subgraph WU0["WFUpBlock 0: 32 &rarr; 64, ch 1024 &rarr; 1024, num_resblocks=3"]
         WU0B["branch_conv: ResBlock 1024 &rarr; 1152, GN+Swish<br/>(B, 1152, 32, 32)"]
@@ -368,6 +391,8 @@ graph TB
     style OUTPUT fill:#2d1f4e,stroke:#bc8cff,color:#fff
     style INV_HAAR fill:#1a3a4e,stroke:#d29922,color:#fff
     style DA fill:#2d1f4e,stroke:#d29922,color:#fff
+    style SHORTCUT_D fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style ADD_D fill:#1a2e1a,stroke:#3fb950,color:#fff
 </div>
 
 <div class="callout">
@@ -377,9 +402,10 @@ graph TB
 <li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_up + pixel_shuffle, matching DC-AE. out_res_block is OUTSIDE residual.</li>
 <li><span class="dm y"></span><strong>Cascading wavelet reconstruction</strong>: Each WFUpBlock generates wavelet coefficients, injects previous level LL into current coefficients, then InvHaarWT produces RGB residual <code>w</code> at progressively larger resolutions.</li>
 <li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>decoder_num_resblocks=[3,4,12,2]</code>, so <code>res_block</code> has <code>num-2</code> ResBlocks (1, 2, 10, 0) in main trunk after branch split. Total per stage = num counting branch_conv + res_block + out_res_block. Heavy middle at Up2 (12 blocks).</li>
+<li><span class="dm g"></span><strong>I/O shortcut (new)</strong>: Non-parametric <code>repeat_interleave</code> shortcut from latent <code>z</code> bypasses <code>conv_in</code>. Formula: <code>z.repeat_interleave(base_channels[-1]//latent_dim, dim=1)</code> — for current config, 64→1024 via 16× channel duplication. HunyuanVAE-aligned. Gated by <code>use_io_shortcut=True</code>.</li>
 <li><span class="dm r"></span><strong>No encoder skip connections</strong>: Decoder is fully independent, all information comes from latent <code>z</code>.</li>
 </ul>
-<p class="src-ref">Source: modeling_wfvae2.py Decoder L209-276, WFUpBlock L82-139</p>
+<p class="src-ref">Source: modeling_wfvae2.py Decoder L209-292, WFUpBlock L82-139</p>
 </div>
 </div>
 </div>
@@ -587,6 +613,231 @@ graph LR
 <li><span class="dm g"></span><strong>No skip connections</strong>: Decoder wavelet flow is entirely self-generated from latent. No encoder coefficients are passed to decoder at inference.</li>
 </ul>
 </div>
+</div>
+</div>
+
+<!-- ===== 7. DISCRIMINATOR & LOSS ===== -->
+<div class="section" id="discriminator">
+<div class="section-title">7. Discriminator &amp; Adversarial Loss (pix2pixHD) <span class="badge badge-ov">Training</span></div>
+<div class="section-body">
+
+<p style="color:var(--muted); margin-bottom:1rem; font-size:.9rem;">
+Two discriminator variants coexist — switch via <code>--disc_type {single,multiscale}</code>. The legacy single-scale PatchGAN lives in <code>discriminator.py</code> (untouched); the pix2pixHD-style multi-scale disc + feature-matching loss live in <code>multiscale_discriminator.py</code>.
+</p>
+
+<h3 style="color:var(--purple); margin:1rem 0 .5rem; font-size:1.05rem;">7.1 Training pipeline (generator step)</h3>
+
+<div class="mermaid">
+graph LR
+    REAL["real x<br/>(B, 3, H, W)"]
+    VAE["VAE<br/>(Encoder + Decoder)"]
+    REC["reconstruction<br/>(B, 3, H, W)"]
+    L1["L1/L2 + LPIPS<br/>→ rec_loss, nll_loss"]
+    KL["posterior KL<br/>→ kl_loss"]
+    WL["wavelet L1<br/>→ wavelet_loss"]
+
+    REAL --> VAE
+    VAE --> REC
+    VAE -.->|"posteriors"| KL
+    VAE -.->|"enc/dec coeffs"| WL
+    REAL --> L1
+    REC --> L1
+
+    subgraph DISC_BLOCK["Discriminator forward (2 passes per gen step)"]
+        D_REC["D(reconstruction)<br/>List[List[Tensor]]"]
+        D_REAL["D(real.detach())<br/>List[List[Tensor]]<br/>(only for FM loss)"]
+    end
+    REC --> D_REC
+    REAL --> D_REAL
+
+    subgraph LOSS["Loss computation"]
+        GLOSS["g_loss = mean over scales of<br/>-mean(D(rec)[i][-1])"]
+        FMLOSS["fm_loss = λ_feat · Σ_i Σ_j<br/>D_w · feat_w · L1(D(rec)[i][j],<br/>D(real)[i][j].detach())"]
+    end
+    D_REC --> GLOSS
+    D_REC --> FMLOSS
+    D_REAL --> FMLOSS
+
+    ADAPTIVE["adaptive d_weight<br/>= ||nll_grads||/||g_grads||"]
+    GLOSS --> ADAPTIVE
+    L1 --> ADAPTIVE
+
+    TOTAL["total_loss =<br/>nll + kl·kl_w + d_w·disc_factor·g_loss<br/>+ wl·wl_w + fm_loss"]
+    L1 --> TOTAL
+    KL --> TOTAL
+    WL --> TOTAL
+    ADAPTIVE --> TOTAL
+    GLOSS --> TOTAL
+    FMLOSS --> TOTAL
+
+    style REAL fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style REC fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style TOTAL fill:#2d1a1a,stroke:#f85149,color:#fff
+    style FMLOSS fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style GLOSS fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style ADAPTIVE fill:#3d1a4e,stroke:#d29922,color:#fff
+</div>
+
+<div class="callout">
+<h4>Pipeline notes</h4>
+<ul>
+<li><span class="dm g"></span><strong>Two disc forwards per gen step</strong>: in multiscale mode, the generator step runs D on both reconstruction and real (the latter detached) because feature matching needs paired intermediate features. This adds ~1 extra disc forward compared to single-scale.</li>
+<li><span class="dm c"></span><strong>Adaptive d_weight is untouched</strong>: <code>g_loss</code> is aggregated to a scalar before gradient computation, so <code>calculate_adaptive_weight</code> still sees a single scalar and its logic is identical to single-scale.</li>
+<li><span class="dm y"></span><strong>Feature matching is outside the adaptive weight</strong>: <code>fm_loss</code> uses a fixed <code>λ_feat=10.0</code> multiplier, not the adaptive <code>d_weight</code>. This mirrors pix2pixHD.</li>
+<li><span class="dm r"></span><strong>Alternating gen/disc</strong>: discriminator step is a separate call with <code>optimizer_idx=1</code>, runs <code>D(real.detach())</code> and <code>D(rec.detach())</code> and computes per-scale hinge loss averaged across scales.</li>
+</ul>
+<p class="src-ref">Source: perceptual_loss_2d.py forward() lines ~110-210</p>
+</div>
+
+<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">7.2 MultiscaleDiscriminator (num_D=3)</h3>
+
+<div class="mermaid">
+graph TB
+    IN["input x<br/>(B, 3, H, W)"]
+    DS1["AvgPool2d(3, s=2)"]
+    DS2["AvgPool2d(3, s=2)"]
+    IN --> DS1 --> DS2
+
+    subgraph S0["Scale 0 (full res)"]
+        D0["NLayerDiscriminatorWithFeat<br/>5 layers → [l0..l3, logit]"]
+    end
+    subgraph S1["Scale 1 (H/2, W/2)"]
+        D1["NLayerDiscriminatorWithFeat<br/>5 layers → [l0..l3, logit]"]
+    end
+    subgraph S2["Scale 2 (H/4, W/4)"]
+        D2["NLayerDiscriminatorWithFeat<br/>5 layers → [l0..l3, logit]"]
+    end
+
+    IN --> D0
+    DS1 --> D1
+    DS2 --> D2
+
+    OUT["result: List[List[Tensor]]<br/>outer len=num_D (3)<br/>inner len=n_layers+2 (5)<br/>result[i][-1] = final logit (for GAN)<br/>result[i][:-1] = features (for FM)"]
+    D0 --> OUT
+    D1 --> OUT
+    D2 --> OUT
+
+    style IN fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style OUT fill:#2d1040,stroke:#bc8cff,color:#fff
+    style D0 fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style D1 fill:#1a2e1a,stroke:#3fb950,color:#fff
+    style D2 fill:#1a2e1a,stroke:#3fb950,color:#fff
+</div>
+
+<div class="callout">
+<h4>Multi-scale design</h4>
+<ul>
+<li><span class="dm g"></span><strong>Independent parameters</strong>: each scale has its own <code>NLayerDiscriminatorWithFeat</code> with independent weights. No weight sharing across scales.</li>
+<li><span class="dm c"></span><strong>Progressive downsampling</strong>: <code>AvgPool2d(3, stride=2, padding=[1,1], count_include_pad=False)</code> between scales. For 1024px input, the three scales see 1024→512→256.</li>
+<li><span class="dm y"></span><strong>Why multi-scale</strong>: a single PatchGAN at full resolution has a limited receptive field (~70×70 for n_layers=3), missing coarse structure at high resolution. Downsampled scales give the disc an explicit "zoom-out" view.</li>
+<li><span class="dm r"></span><strong>Output convention</strong>: <code>result[0]</code> is full-res, <code>result[num_D-1]</code> is the most downsampled (pix2pixHD uses <code>num_D-1-i</code> indexing internally).</li>
+</ul>
+<p class="src-ref">Source: multiscale_discriminator.py MultiscaleDiscriminator.forward()</p>
+</div>
+
+<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">7.3 Single PatchGAN internal structure (n_layers=3)</h3>
+
+<div class="mermaid">
+graph TB
+    X["input (B, 3, h, w)"]
+
+    M0["model0: Conv(3→64, k=4, s=2) + LReLU(0.2)<br/>(no BatchNorm on first layer)"]
+    M1["model1: Conv(64→128, k=4, s=2) + BN + LReLU"]
+    M2["model2: Conv(128→256, k=4, s=2) + BN + LReLU"]
+    M3["model3: Conv(256→512, k=4, s=1) + BN + LReLU<br/>(penultimate, stride=1)"]
+    M4["model4: Conv(512→1, k=4, s=1)<br/>(final logit, 1-channel)"]
+
+    X --> M0 --> L0["l0<br/>(B, 64, h/2, w/2)"]
+    L0 --> M1 --> L1["l1<br/>(B, 128, h/4, w/4)"]
+    L1 --> M2 --> L2["l2<br/>(B, 256, h/8, w/8)"]
+    L2 --> M3 --> L3["l3<br/>(B, 512, h/8, w/8)"]
+    L3 --> M4 --> LOGIT["final_logit<br/>(B, 1, h/8, w/8)"]
+
+    RETURN["Returns [l0, l1, l2, l3, final_logit]<br/>(5 entries = n_layers+2)"]
+    L0 -.-> RETURN
+    L1 -.-> RETURN
+    L2 -.-> RETURN
+    L3 -.-> RETURN
+    LOGIT --> RETURN
+
+    style X fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style LOGIT fill:#2d1a1a,stroke:#f85149,color:#fff
+    style RETURN fill:#2d1040,stroke:#bc8cff,color:#fff
+</div>
+
+<div class="callout">
+<h4>PatchGAN details</h4>
+<ul>
+<li><span class="dm g"></span><strong>Normalization</strong>: <code>BatchNorm2d</code> on all layers except model0 (first Conv) and model4 (final logit). Aligns with pix2pixHD original.</li>
+<li><span class="dm c"></span><strong>Penultimate stride change</strong>: model3 uses stride=1 (vs stride=2 elsewhere) so the final receptive field stays moderate (~70×70 effective for n_layers=3).</li>
+<li><span class="dm y"></span><strong>Feature extraction</strong>: because each block is registered as <code>self.modelN</code> separately, forward can collect outputs progressively into a list. Without this split, FM loss cannot access intermediate activations.</li>
+<li><span class="dm r"></span><strong>Small-batch concern</strong>: BatchNorm statistics are noisy at BS=2 in DDP (no SyncBN). If 1024px training is unstable, consider porting <code>InstanceNorm2d</code> — left as future work.</li>
+</ul>
+<p class="src-ref">Source: multiscale_discriminator.py NLayerDiscriminatorWithFeat</p>
+</div>
+
+<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">7.4 Loss formulas</h3>
+
+<div style="background:var(--bg); padding:1.2rem; border-radius:8px; border:1px solid var(--border); font-family:ui-monospace,monospace; font-size:.88rem; line-height:1.9; color:var(--text); margin-top:.5rem;">
+<div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Total generator loss</div>
+total_loss = nll_loss / exp(logvar) + logvar<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + kl_weight · kl_loss<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + d_weight · disc_factor · <span style="color:var(--green);">g_loss</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + wavelet_weight · wavelet_loss<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + <span style="color:var(--green);">fm_loss</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);">// ← new in multiscale mode</span>
+<br/><br/>
+<div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Multi-scale g_loss (average over scales)</div>
+pred_fake = D(reconstructions)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># List[List[Tensor]]</span><br/>
+g_loss = (1/num_D) · Σ_i [ -mean(pred_fake[i][-1]) ]
+<br/><br/>
+<div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Feature matching loss (L1 on intermediate features)</div>
+pred_real = D(inputs.detach())&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># extra D forward on real</span><br/>
+feat_weights = 4 / (n_layers_D + 1)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># per-layer weight</span><br/>
+D_weights&nbsp;&nbsp;&nbsp; = 1 / num_D&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># per-scale weight</span><br/>
+<br/>
+fm_loss = 0<br/>
+for i in range(num_D):&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># all scales</span><br/>
+&nbsp;&nbsp;&nbsp; for j in range(n_layers_D + 1):&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># all layers except final logit</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; fm_loss += D_weights · feat_weights · L1(<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; pred_fake[i][j],&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># gradient flows to generator</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; pred_real[i][j].detach()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># real features = frozen target</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; )<br/>
+fm_loss *= feat_match_weight&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># λ_feat = 10.0 (pix2pixHD default)</span>
+<br/><br/>
+<div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Discriminator step — multi-scale hinge loss</div>
+pred_real = D(inputs.detach())<br/>
+pred_fake = D(reconstructions.detach())<br/>
+d_loss = (1/num_D) · Σ_i [ hinge_d_loss(<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; pred_real[i][-1], pred_fake[i][-1]<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ) ]<br/>
+<br/>
+<span style="color:var(--muted);"># hinge_d_loss = 0.5 · ( relu(1 - real) + relu(1 + fake) )</span>
+</div>
+
+<div class="callout">
+<h4>Default values (aggressive route, currently deployed)</h4>
+<ul>
+<li><strong>num_D</strong> = 3 (scales: full-res, /2, /4)</li>
+<li><strong>n_layers_D</strong> = 3 (conv depth per PatchGAN)</li>
+<li><strong>ndf</strong> = 64 (base disc channel count)</li>
+<li><strong>feat_match_weight</strong> (λ_feat) = 10.0</li>
+<li><strong>disc_weight</strong> = 0.5 (unchanged)</li>
+<li><strong>disc_loss</strong> = "hinge" (unchanged)</li>
+<li><strong>disc_start</strong> = 5 (unchanged — disc activates from step 5 onward)</li>
+<li><strong>Disc params</strong>: single-scale 2.77 M → multi-scale <strong>8.30 M</strong> (~3×)</li>
+</ul>
+</div>
+
+<div class="callout">
+<h4>Coexistence — not a replacement</h4>
+<ul>
+<li><span class="dm g"></span>The original <code>NLayerDiscriminator</code> in <code>discriminator.py</code> is <strong>untouched</strong>. Run <code>DISC_TYPE=single bash train_wfivae.sh</code> to use it and get identical behavior to pre-patch runs.</li>
+<li><span class="dm c"></span><code>train_wfivae.sh</code> auto-suffixes <code>EXP_NAME</code> with <code>_single</code>/<code>_multiscale</code>, so checkpoints and CSV from the two variants live in disjoint output directories and can be trained side-by-side.</li>
+<li><span class="dm r"></span>Checkpoints are <strong>not cross-compatible</strong> (param shapes differ). Resuming with the wrong <code>disc_type</code> raises a PyTorch shape-mismatch at load time.</li>
+<li><span class="dm y"></span>Ablation knobs: <code>FEAT_MATCH_WEIGHT=0</code> disables FM loss while keeping the multi-scale GAN loss; <code>NUM_D=2</code> drops to 2 scales to save memory.</li>
+</ul>
+</div>
+
 </div>
 </div>
 

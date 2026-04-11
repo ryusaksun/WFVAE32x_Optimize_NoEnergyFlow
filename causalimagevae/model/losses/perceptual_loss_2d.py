@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from .lpips import LPIPS
 from .discriminator import NLayerDiscriminator, weights_init
+from .multiscale_discriminator import MultiscaleDiscriminator
 from ..modules.wavelet import HaarWaveletTransform2D
 
 
@@ -36,7 +37,15 @@ def l2(x, y):
 
 
 class LPIPSWithDiscriminator(nn.Module):
-    """LPIPS loss with discriminator for 2D images"""
+    """LPIPS loss with discriminator for 2D images.
+
+    Supports two discriminator variants via ``disc_type``:
+
+    - ``"single"`` — original single-scale PatchGAN (`NLayerDiscriminator`).
+      Backward-compatible default behavior for legacy experiments.
+    - ``"multiscale"`` — pix2pixHD multi-scale PatchGAN with feature-matching
+      loss (see `multiscale_discriminator.py`). Enables ``feat_match_weight``.
+    """
     def __init__(
         self,
         disc_start,
@@ -55,10 +64,21 @@ class LPIPSWithDiscriminator(nn.Module):
         wavelet_weight=0.01,
         loss_type: str = "l1",
         adaptive_weight_clamp: float = 1e5,
+        # --- multi-scale discriminator + feature matching (pix2pixHD) ---
+        disc_type: str = "single",
+        num_D: int = 3,
+        n_layers_D: int = 3,
+        feat_match_weight: float = 10.0,
+        # --- discriminator normalization switch (Miyato et al. 2018) ---
+        disc_norm: str = "bn",
     ):
 
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
+        assert disc_type in ["single", "multiscale"]
+        assert disc_norm in ["bn", "sn", "in", "none"], (
+            f"disc_norm must be one of bn|sn|in|none, got {disc_norm!r}"
+        )
         self.wavelet_weight = wavelet_weight
         self.kl_weight = kl_weight
         self.pixel_weight = pixelloss_weight
@@ -67,9 +87,24 @@ class LPIPSWithDiscriminator(nn.Module):
         self.logvar = nn.Parameter(
             torch.full((), logvar_init), requires_grad=learn_logvar
         )
-        self.discriminator = NLayerDiscriminator(
-            input_nc=disc_in_channels, ndf=64, n_layers=disc_num_layers, use_actnorm=use_actnorm
-        ).apply(weights_init)
+
+        self.disc_type = disc_type
+        self.num_D = num_D
+        self.n_layers_D = n_layers_D
+        self.feat_match_weight = feat_match_weight
+        self.disc_norm = disc_norm
+        if disc_type == "multiscale":
+            self.discriminator = MultiscaleDiscriminator(
+                input_nc=disc_in_channels, ndf=64,
+                n_layers=n_layers_D, num_D=num_D,
+                disc_norm=disc_norm,
+            ).apply(weights_init)
+        else:
+            self.discriminator = NLayerDiscriminator(
+                input_nc=disc_in_channels, ndf=64,
+                n_layers=disc_num_layers, use_actnorm=use_actnorm,
+                disc_norm=disc_norm,
+            ).apply(weights_init)
         self.discriminator_iter_start = disc_start
         self.disc_loss = hinge_d_loss if disc_loss == "hinge" else vanilla_d_loss
         self.disc_factor = disc_factor
@@ -77,6 +112,41 @@ class LPIPSWithDiscriminator(nn.Module):
         self.disc_conditional = disc_conditional
         self.loss_func = l1 if loss_type == "l1" else l2
         self.adaptive_weight_clamp = adaptive_weight_clamp
+
+    # ------------------------------------------------------------------
+    # Multi-scale discriminator helpers
+    # ------------------------------------------------------------------
+    def _multiscale_g_loss(self, pred_list):
+        """Average of -mean(final_logit) across all scales. Returns a scalar."""
+        losses = [-torch.mean(p[-1]) for p in pred_list]
+        return sum(losses) / len(losses)
+
+    def _multiscale_d_loss(self, pred_real, pred_fake):
+        """Per-scale hinge/vanilla disc loss, averaged across scales."""
+        losses = [self.disc_loss(r[-1], f[-1]) for r, f in zip(pred_real, pred_fake)]
+        return sum(losses) / len(losses)
+
+    def _feature_match_loss(self, pred_fake, pred_real):
+        """pix2pixHD feature-matching loss: L1 on intermediate discriminator features.
+
+        Matches all layers except the final logit. Already multiplied by
+        ``feat_match_weight``.
+        """
+        feat_weights = 4.0 / (self.n_layers_D + 1)
+        D_weights = 1.0 / self.num_D
+        loss = pred_fake[0][0].new_zeros(())
+        for i in range(self.num_D):
+            # len(pred_fake[i]) == n_layers + 2; skip the final element (logit)
+            for j in range(len(pred_fake[i]) - 1):
+                loss = loss + D_weights * feat_weights * F.l1_loss(
+                    pred_fake[i][j], pred_real[i][j].detach()
+                )
+        return loss * self.feat_match_weight
+
+    @staticmethod
+    def _logits_mean(pred_list):
+        """Aggregate final logits across scales into a scalar (for logging)."""
+        return torch.stack([p[-1].detach().mean() for p in pred_list]).mean()
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
         layer = last_layer if last_layer is not None else self.last_layer[0]
@@ -142,10 +212,24 @@ class LPIPSWithDiscriminator(nn.Module):
             else:
                 wl_loss = torch.tensor(0.0, device=inputs.device)
 
-            # GAN loss
+            # GAN loss (+ optional feature-matching loss for multiscale path)
+            fm_loss = torch.zeros((), device=inputs.device)
             if global_step >= self.discriminator_iter_start:
-                logits_fake = self.discriminator(reconstructions)
-                g_loss = -torch.mean(logits_fake)
+                if self.disc_type == "multiscale":
+                    pred_fake = self.discriminator(reconstructions)
+                    g_loss = self._multiscale_g_loss(pred_fake)
+                    if self.feat_match_weight > 0:
+                        # pred_real is only needed as a frozen L1 target — wrap in
+                        # no_grad to free D's intermediate activations (~8-12 GB @
+                        # 1024px). Detach at L1 call still keeps gradient from
+                        # flowing back through pred_real.
+                        with torch.no_grad():
+                            pred_real = self.discriminator(inputs.detach())
+                        fm_loss = self._feature_match_loss(pred_fake, pred_real)
+                else:
+                    logits_fake = self.discriminator(reconstructions)
+                    g_loss = -torch.mean(logits_fake)
+
                 if self.disc_factor > 0.0:
                     d_weight = self.calculate_adaptive_weight(
                         nll_loss, g_loss, last_layer=last_layer
@@ -168,6 +252,7 @@ class LPIPSWithDiscriminator(nn.Module):
                 + self.kl_weight * kl_loss
                 + d_weight * disc_factor * g_loss
                 + self.wavelet_weight * wl_loss
+                + fm_loss
             )
 
             log = {
@@ -183,6 +268,7 @@ class LPIPSWithDiscriminator(nn.Module):
             log[f"{split}/p_loss"] = p_loss.detach().mean() if self.perceptual_weight > 0 else torch.tensor(0.0, device=inputs.device)
             log[f"{split}/nll_grads_norm"] = self._last_nll_grads_norm
             log[f"{split}/g_grads_norm"] = self._last_g_grads_norm
+            log[f"{split}/fm_loss"] = fm_loss.detach().mean()
             if self.wavelet_weight > 0:
                 log[f"{split}/wl_loss"] = wl_loss.detach().mean()
             log[f"{split}/kl_per_channel"] = kl_per_ch.detach().cpu()
@@ -190,17 +276,27 @@ class LPIPSWithDiscriminator(nn.Module):
             return loss, log
 
         if optimizer_idx == 1:  # Discriminator
-            logits_real = self.discriminator(inputs.detach())
-            logits_fake = self.discriminator(reconstructions.detach())
+            if self.disc_type == "multiscale":
+                pred_real = self.discriminator(inputs.detach())
+                pred_fake = self.discriminator(reconstructions.detach())
+                d_loss_raw = self._multiscale_d_loss(pred_real, pred_fake)
+                logits_real_mean = self._logits_mean(pred_real)
+                logits_fake_mean = self._logits_mean(pred_fake)
+            else:
+                logits_real = self.discriminator(inputs.detach())
+                logits_fake = self.discriminator(reconstructions.detach())
+                d_loss_raw = self.disc_loss(logits_real, logits_fake)
+                logits_real_mean = logits_real.detach().mean()
+                logits_fake_mean = logits_fake.detach().mean()
 
             disc_factor = adopt_weight(
                 self.disc_factor, global_step, threshold=self.discriminator_iter_start
             )
-            d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
+            d_loss = disc_factor * d_loss_raw
 
             log = {
                 f"{split}/disc_loss": d_loss.clone().detach().mean(),
-                f"{split}/logits_real": logits_real.detach().mean(),
-                f"{split}/logits_fake": logits_fake.detach().mean(),
+                f"{split}/logits_real": logits_real_mean,
+                f"{split}/logits_fake": logits_fake_mean,
             }
             return d_loss, log

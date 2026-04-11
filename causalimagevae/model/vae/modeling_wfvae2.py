@@ -151,6 +151,7 @@ class Encoder(VideoBaseAE):
         norm_type: str = "groupnorm",
         base_channels: List[int] = [128, 256, 512],
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
+        use_io_shortcut: bool = True,
     ) -> None:
         super().__init__()
         num_down_stages = len(base_channels) - 1
@@ -160,6 +161,15 @@ class Encoder(VideoBaseAE):
             f"encoder num_resblocks length {len(num_resblocks)} must match "
             f"number of down stages {num_down_stages}"
         )
+
+        self.latent_dim = latent_dim
+        self.base_channels = base_channels
+        self.use_io_shortcut = use_io_shortcut
+        if use_io_shortcut:
+            assert base_channels[-1] % (2 * latent_dim) == 0, (
+                f"Encoder I/O shortcut 要求 base_channels[-1]={base_channels[-1]} "
+                f"能被 2*latent_dim={2*latent_dim} 整除"
+            )
 
         # 2D Haar: 12 channels (4 coeffs × 3 RGB)
         self.wavelet_transform_in = HaarWaveletTransform2D()
@@ -196,6 +206,14 @@ class Encoder(VideoBaseAE):
             base_channels[-1], latent_dim * 2, kernel_size=3, stride=1, padding=1
         )
 
+    def _out_shortcut(self, h):
+        """非参数 shortcut: [B, base_channels[-1], H, W] -> [B, 2*latent_dim, H, W].
+        按通道分组取均值 (DC-AE / HunyuanVAE 风格)。零参数。
+        """
+        B, C, H, W = h.shape
+        out_ch = 2 * self.latent_dim
+        return h.reshape(B, out_ch, C // out_ch, H, W).mean(dim=2)
+
     def forward(self, x):
         coeffs = self.wavelet_transform_in(x)
         h = self.conv_in(coeffs)
@@ -207,9 +225,12 @@ class Encoder(VideoBaseAE):
 
         h = self.mid(h)
 
+        shortcut = self._out_shortcut(h) if self.use_io_shortcut else None
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
+        if shortcut is not None:
+            h = h + shortcut
 
         return h, inter_coeffs
 
@@ -226,6 +247,7 @@ class Decoder(VideoBaseAE):
         norm_type: str = "groupnorm",
         base_channels: List[int] = [128, 256, 512],
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
+        use_io_shortcut: bool = True,
     ) -> None:
         super().__init__()
         self.energy_flow_size = energy_flow_size
@@ -237,6 +259,15 @@ class Decoder(VideoBaseAE):
             f"decoder num_resblocks length {len(num_resblocks)} must match "
             f"number of up stages {num_up_stages}"
         )
+
+        self.latent_dim = latent_dim
+        self.base_channels = base_channels
+        self.use_io_shortcut = use_io_shortcut
+        if use_io_shortcut:
+            assert base_channels[-1] % latent_dim == 0, (
+                f"Decoder I/O shortcut 要求 base_channels[-1]={base_channels[-1]} "
+                f"能被 latent_dim={latent_dim} 整除"
+            )
 
         self.conv_in = Conv2d(
             latent_dim, base_channels[-1], kernel_size=3, stride=1, padding=1
@@ -276,8 +307,17 @@ class Decoder(VideoBaseAE):
         self.conv_out = Conv2d(base_channels[0], 12, kernel_size=3, stride=1, padding=1)
         self.inverse_wavelet_transform_out = InverseHaarWaveletTransform2D()
 
+    def _in_shortcut(self, z):
+        """非参数 shortcut: [B, latent_dim, H, W] -> [B, base_channels[-1], H, W].
+        按通道 repeat_interleave (DC-AE / HunyuanVAE 风格)。零参数。
+        """
+        repeats = self.base_channels[-1] // self.latent_dim
+        return z.repeat_interleave(repeats, dim=1)
+
     def forward(self, z):
         h = self.conv_in(z)
+        if self.use_io_shortcut:
+            h = h + self._in_shortcut(z)
         h = self.mid(h)
         inter_coeffs = []
         w = None
@@ -309,6 +349,7 @@ class WFIVAE2Model(VideoBaseAE):
         dropout: float = 0.0,
         norm_type: str = "groupnorm",
         mid_layers_type: List[str] = ["ResnetBlock2D", "Attention2DFix", "ResnetBlock2D"],
+        use_io_shortcut: bool = True,
         scale: List[float] = [0.18215] * 16,
         shift: List[float] = [0] * 16,
     ) -> None:
@@ -326,7 +367,8 @@ class WFIVAE2Model(VideoBaseAE):
             energy_flow_size=encoder_energy_flow_size,
             dropout=dropout,
             norm_type=norm_type,
-            mid_layers_type=mid_layers_type
+            mid_layers_type=mid_layers_type,
+            use_io_shortcut=use_io_shortcut,
         )
         self.decoder = Decoder(
             latent_dim=latent_dim,
@@ -335,7 +377,8 @@ class WFIVAE2Model(VideoBaseAE):
             energy_flow_size=decoder_energy_flow_size,
             dropout=dropout,
             norm_type=norm_type,
-            mid_layers_type=mid_layers_type
+            mid_layers_type=mid_layers_type,
+            use_io_shortcut=use_io_shortcut,
         )
 
     def get_encoder(self):

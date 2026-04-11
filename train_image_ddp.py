@@ -484,7 +484,21 @@ def train(args):
         wavelet_weight=args.wavelet_weight,
         adaptive_weight_clamp=args.adaptive_weight_clamp,
         learn_logvar=args.learn_logvar,
+        disc_type=args.disc_type,
+        num_D=args.num_D,
+        n_layers_D=args.n_layers_D,
+        feat_match_weight=args.feat_match_weight,
+        disc_norm=args.disc_norm,
     )
+    if global_rank == 0:
+        disc_params = sum(p.numel() for p in disc.discriminator.parameters())
+        logger.info(
+            f"discriminator: type={args.disc_type} norm={args.disc_norm}"
+            + (f" num_D={args.num_D} n_layers_D={args.n_layers_D} "
+               f"feat_match_weight={args.feat_match_weight}"
+               if args.disc_type == "multiscale" else "")
+            + f" | params={disc_params/1e6:.2f} M"
+        )
 
     # DDP
     model = model.to(rank)
@@ -658,6 +672,7 @@ def train(args):
         fieldnames = [
             "step", "generator_loss", "discriminator_loss",
             "rec_loss", "perceptual_loss", "kl_loss", "wavelet_loss",
+            "fm_loss",
             "nll_loss",
             "g_loss", "d_weight",
             "logits_real", "logits_fake",
@@ -926,6 +941,7 @@ def train(args):
                             "perceptual_loss": "",
                             "kl_loss": "",
                             "wavelet_loss": "",
+                            "fm_loss": "",
                             "nll_loss": "",
                             "g_loss": "", "d_weight": "",
                             "logits_real": "", "logits_fake": "",
@@ -1064,6 +1080,7 @@ def train(args):
                         "perceptual_loss": _to_csv_scalar(g_log.get('train/p_loss')),
                         "kl_loss": _to_csv_scalar(g_log.get('train/kl_loss')),
                         "wavelet_loss": _to_csv_scalar(g_log.get('train/wl_loss')),
+                        "fm_loss": _to_csv_scalar(g_log.get('train/fm_loss')),
                         "nll_loss": _to_csv_scalar(g_log.get('train/nll_loss')),
                         "g_loss": _to_csv_scalar(g_log.get('train/g_loss')),
                         "d_weight": _to_csv_scalar(g_log.get('train/d_weight')),
@@ -1107,6 +1124,7 @@ def train(args):
                         "perceptual_loss": "",
                         "kl_loss": "",
                         "wavelet_loss": "",
+                        "fm_loss": "",
                         "nll_loss": "",
                         "g_loss": "",
                         "d_weight": "",
@@ -1345,6 +1363,11 @@ def main():
     parser.add_argument("--disc_weight", type=float, default=0.5, help="discriminator loss weight")
     parser.add_argument("--adaptive_weight_clamp", type=float, default=1e5, help="clamp upper bound for adaptive d_weight (default 1e5, lower to reduce disc influence)")
     parser.add_argument("--disc_lr", type=float, default=None, help="discriminator learning rate (default: same as --lr, TTUR recommends 2-4x)")
+    parser.add_argument("--disc_type", type=str, default="single", choices=["single", "multiscale"], help="discriminator variant: 'single' = original PatchGAN (default), 'multiscale' = pix2pixHD-style N-scale disc + feature matching")
+    parser.add_argument("--num_D", type=int, default=3, help="number of discriminator scales (multiscale only)")
+    parser.add_argument("--n_layers_D", type=int, default=3, help="number of conv layers per discriminator (multiscale only)")
+    parser.add_argument("--feat_match_weight", type=float, default=10.0, help="pix2pixHD feature-matching loss weight (multiscale only; 0 disables)")
+    parser.add_argument("--disc_norm", type=str, default="bn", choices=["bn", "sn", "in", "none"], help="discriminator normalization: bn (default, BatchNorm2d), sn (spectral_norm + Identity, Miyato et al. 2018), in (InstanceNorm2d), none (Identity, pure ablation)")
     parser.add_argument("--kl_weight", type=float, default=1e-06, help="KL divergence weight")
     parser.add_argument("--perceptual_weight", type=float, default=1.0, help="perceptual loss weight")
     parser.add_argument("--loss_type", type=str, default="l1", help="reconstruction loss type")
