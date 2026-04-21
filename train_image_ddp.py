@@ -30,7 +30,14 @@ except ImportError:
     lpips = None
 
 import csv
+import datetime
+import getpass
+import json
+import platform
+import shlex
 import signal
+import socket
+import subprocess
 import sys
 
 def set_random_seed(seed):
@@ -79,6 +86,215 @@ def total_params(model):
 
 def get_exp_name(args):
     return f"{args.exp_name}-lr{args.lr:.2e}-bs{args.batch_size}-rs{args.resolution}"
+
+
+def _git_info():
+    def _run(cmd):
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=3, check=False,
+            )
+            return out.stdout.strip() if out.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    sha = _run(["git", "rev-parse", "HEAD"])
+    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    porcelain = _run(["git", "status", "--porcelain"])
+    if sha:
+        short = sha[:8]
+        dirty_lines = [l for l in porcelain.splitlines() if l.strip()]
+        dirty = f"dirty ({len(dirty_lines)} files)" if dirty_lines else "clean"
+        return {"sha": short, "branch": branch or "unknown", "status": dirty}
+    return {"sha": "unknown", "branch": "unknown", "status": "unknown"}
+
+
+def write_experiment_readme(args, model, ckpt_dir: Path) -> None:
+    """在实验目录写入/追加 README.md，记录本次运行的全部参数/配置/命令。
+
+    首次运行写完整文档；同一目录再次启动（resume 或重跑）时追加一个
+    `## 第 N 次运行 @ timestamp` 区块，保留完整审计链。
+    """
+    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+    exp_name = get_exp_name(args)
+
+    # ---- git / software / distributed info (each try/except) ----
+    git = _git_info()
+
+    try:
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
+    except Exception:
+        gpu_name = "unknown"
+    try:
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+    except Exception:
+        world_size = 1
+
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    master_addr = os.environ.get("MASTER_ADDR", "")
+    master_port = os.environ.get("MASTER_PORT", "")
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = "unknown"
+    try:
+        username = getpass.getuser()
+    except Exception:
+        username = "unknown"
+
+    # ---- 启动状态 ----
+    if getattr(args, "resume_from_checkpoint", None):
+        status_line = f"从 `{args.resume_from_checkpoint}` 恢复"
+    else:
+        status_line = "全新启动"
+
+    # ---- 启动命令 ----
+    # 原始用户键入 (由 train_wfivae.sh 在启动时导出 WFVAE_LAUNCH_CMD)
+    user_launch_cmd = os.environ.get("WFVAE_LAUNCH_CMD", "").strip()
+    # 展开后的 torchrun 命令 (从 sys.argv 和 torchrun 环境变量重构)
+    argv_str = " ".join(shlex.quote(a) for a in sys.argv)
+    if world_size > 1 and master_addr and master_port:
+        torchrun_cmd = (
+            f"CUDA_VISIBLE_DEVICES={cuda_visible or '<unset>'} "
+            f"torchrun --nnodes=1 --nproc_per_node={world_size} "
+            f"--master_addr={master_addr} --master_port={master_port} "
+            f"{argv_str}"
+        )
+    else:
+        torchrun_cmd = f"CUDA_VISIBLE_DEVICES={cuda_visible or '<unset>'} {argv_str}"
+
+    # ---- 输出路径 ----
+    csv_name = f"{args.exp_name}.csv"
+    paths_rows = [
+        ("实验目录", str(ckpt_dir)),
+        ("Checkpoints", str(ckpt_dir / "checkpoints")),
+        ("Loss CSV", str(ckpt_dir / csv_name)),
+        ("验证图像", str(ckpt_dir / "val_images")),
+        ("训练曲线", str(ckpt_dir / "training_curves.png")),
+    ]
+    paths_table = "| 用途 | 路径 |\n|---|---|\n" + "\n".join(
+        f"| {k} | `{v}` |" for k, v in paths_rows
+    )
+
+    # ---- 模型 ----
+    try:
+        param_m = total_params(model)
+    except Exception:
+        param_m = -1
+    try:
+        model_config_json = json.dumps(
+            dict(model.config), indent=2, ensure_ascii=False, default=str
+        )
+    except Exception as e:
+        model_config_json = f"(failed to serialize model.config: {e})"
+
+    # ---- 分布式 ----
+    accum = getattr(args, "gradient_accumulation_steps", 1)
+    effective_bs = args.batch_size * world_size * accum
+    dist_rows = [
+        ("CUDA_VISIBLE_DEVICES", cuda_visible or "<unset>"),
+        ("WORLD_SIZE", str(world_size)),
+        ("MASTER_ADDR", master_addr or "<unset>"),
+        ("MASTER_PORT", master_port or "<unset>"),
+        (
+            "等效 batch",
+            f"{args.batch_size} (BS) × {world_size} (GPU) × {accum} (accum) = {effective_bs}",
+        ),
+    ]
+    dist_table = "| Env | Value |\n|---|---|\n" + "\n".join(
+        f"| {k} | {v} |" for k, v in dist_rows
+    )
+
+    # ---- CLI 参数（按 key 字母序） ----
+    args_dict = vars(args)
+    args_rows = []
+    for key in sorted(args_dict.keys()):
+        val = args_dict[key]
+        if val is None:
+            val_str = "None"
+        elif isinstance(val, (list, tuple)):
+            val_str = str(val)
+        else:
+            val_str = str(val)
+        val_str = val_str.replace("|", "\\|")
+        args_rows.append(f"| `{key}` | `{val_str}` |")
+    args_table = "| Key | Value |\n|---|---|\n" + "\n".join(args_rows)
+
+    # ---- 软件环境 ----
+    try:
+        torch_ver = torch.__version__
+        cuda_ver = torch.version.cuda or "unknown"
+    except Exception:
+        torch_ver = cuda_ver = "unknown"
+    sw_rows = [
+        ("Python", platform.python_version()),
+        ("PyTorch", torch_ver),
+        ("CUDA", cuda_ver),
+        ("GPU", gpu_name),
+        ("Platform", platform.platform()),
+    ]
+    sw_table = "| Component | Version |\n|---|---|\n" + "\n".join(
+        f"| {k} | {v} |" for k, v in sw_rows
+    )
+
+    body = f"""### 启动状态
+- **状态**: {status_line}
+- **主机**: `{hostname}` · **用户**: `{username}`
+- **Git**: `{git['sha']}` ({git['branch']}, {git['status']})
+
+### 启动命令
+**原始调用** (用户键入):
+```bash
+{user_launch_cmd or "# WFVAE_LAUNCH_CMD 未设置, 可能是直接 torchrun 启动, 见下方"}
+```
+
+**展开后的 torchrun 命令** (内部实际执行):
+```bash
+{torchrun_cmd}
+```
+
+### 输出路径
+{paths_table}
+
+### 模型
+- **类名**: `{args.model_name}` · **配置**: `{args.model_config}` · **可训练参数**: ~{param_m} M
+
+#### 模型 JSON 配置
+```json
+{model_config_json}
+```
+
+### 分布式设置
+{dist_table}
+
+### CLI 参数
+{args_table}
+
+### 软件环境
+{sw_table}
+"""
+
+    readme_path = ckpt_dir / "README.md"
+    if readme_path.exists():
+        try:
+            existing = readme_path.read_text(encoding="utf-8")
+        except Exception:
+            existing = ""
+        run_num = existing.count("<!-- run ") + 1
+        appended = (
+            f"\n\n---\n\n<!-- run {run_num} @ {timestamp} -->\n"
+            f"## 第 {run_num} 次运行 @ {timestamp}\n\n{body}"
+        )
+        with open(readme_path, "a", encoding="utf-8") as f:
+            f.write(appended)
+    else:
+        header = f"# 实验记录: {exp_name}\n\n"
+        marker = (
+            f"<!-- run 1 @ {timestamp} -->\n"
+            f"## 第 1 次运行 @ {timestamp}\n\n"
+        )
+        readme_path.write_text(header + marker + body, encoding="utf-8")
+
 
 def set_train(modules):
     for module in modules:
@@ -466,6 +682,11 @@ def train(args):
             )
         else:
             logger.warning("WANDB 已禁用，仅写入本地日志与产物文件。")
+
+        try:
+            write_experiment_readme(args, model, ckpt_dir)
+        except Exception as e:
+            logger.warning(f"Failed to write experiment README.md: {e}")
 
     dist.barrier()
 
@@ -1175,11 +1396,13 @@ def train(args):
             inputs = batch["image"].to(rank)
 
             # --- At start of accumulation cycle: select step type and zero grad ---
+            # Alternate gen/disc from step 0 so the discriminator warms up on
+            # real/recon pairs even before `discriminator_iter_start` — at which
+            # point the generator starts consuming D's feedback (g_loss / fm_loss).
+            # Without this warm-up, the gen side of `disc_start` would face a
+            # cold, uncalibrated D and get a gradient shock at the switch.
             if micro_step == 0:
-                if (
-                    current_step % 2 == 1
-                    and current_step >= disc.module.discriminator_iter_start
-                ):
+                if current_step % 2 == 1:
                     set_modules_requires_grad(modules_to_train, False)
                     disc.module.discriminator.requires_grad_(True)
                     step_gen = False
@@ -1370,15 +1593,15 @@ def main():
         default="causalimagevae.model.losses.LPIPSWithDiscriminator",
         help="discriminator class path",
     )
-    parser.add_argument("--disc_start", type=int, default=80000, help="step to start discriminator training")
+    parser.add_argument("--disc_start", type=int, default=80000, help="step to start feeding adversarial loss (g_loss / fm_loss) into the generator. the discriminator itself trains from step 0 — this flag gates the *generator* side only.")
     parser.add_argument("--disc_weight", type=float, default=0.5, help="discriminator loss weight")
     parser.add_argument("--adaptive_weight_clamp", type=float, default=1e5, help="clamp upper bound for adaptive d_weight (default 1e5, lower to reduce disc influence)")
     parser.add_argument("--disc_lr", type=float, default=None, help="discriminator learning rate (default: same as --lr, TTUR recommends 2-4x)")
-    parser.add_argument("--disc_type", type=str, default="single", choices=["single", "multiscale"], help="discriminator variant: 'single' = original PatchGAN (default), 'multiscale' = pix2pixHD-style N-scale disc + feature matching")
+    parser.add_argument("--disc_type", type=str, default="multiscale", choices=["single", "multiscale"], help="discriminator variant: 'single' = original PatchGAN, 'multiscale' = pix2pixHD-style N-scale disc + feature matching (default)")
     parser.add_argument("--num_D", type=int, default=3, help="number of discriminator scales (multiscale only)")
     parser.add_argument("--n_layers_D", type=int, default=3, help="number of conv layers per discriminator (multiscale only)")
     parser.add_argument("--feat_match_weight", type=float, default=10.0, help="pix2pixHD feature-matching loss weight (multiscale only; 0 disables)")
-    parser.add_argument("--disc_norm", type=str, default="bn", choices=["bn", "sn", "in", "none"], help="discriminator normalization: bn (default, BatchNorm2d), sn (spectral_norm + Identity, Miyato et al. 2018), in (InstanceNorm2d), none (Identity, pure ablation)")
+    parser.add_argument("--disc_norm", type=str, default="sn", choices=["bn", "sn", "in", "none"], help="discriminator normalization: sn (default, spectral_norm + Identity, Miyato et al. 2018 — batch-size independent), bn (BatchNorm2d), in (InstanceNorm2d), none (Identity, pure ablation)")
     parser.add_argument("--kl_weight", type=float, default=1e-06, help="KL divergence weight")
     parser.add_argument("--perceptual_weight", type=float, default=1.0, help="perceptual loss weight")
     parser.add_argument("--loss_type", type=str, default="l1", help="reconstruction loss type")

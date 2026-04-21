@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WFVAE2 32x DCAEFixed Architecture</title>
+<title>WFVAE2 32x — DCAE + No Energy Flow</title>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <style>
 :root {
@@ -64,8 +64,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 <body>
 
 <div class="header">
-  <h1>WFVAE2 32x DCAEFixed Architecture</h1>
-  <p>Wavelet Flow VAE &mdash; DCAE-aligned residual shortcuts + Conv&middot;PixelUnshuffle/Shuffle spatial transitions</p>
+  <h1>WFVAE2 32x — DCAE + No Energy Flow</h1>
+  <p>Wavelet Flow VAE &mdash; DCAE shortcut + HunyuanVAE I/O shortcut + ECA channel attention + Multi-scale PatchGAN w/ Spectral Norm &nbsp;|&nbsp; <code style="color:var(--orange);">use_energy_flow = false</code></p>
 </div>
 
 <div class="nav">
@@ -74,8 +74,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <a href="#decoder">3. Decoder</a>
   <a href="#down-detail">4. WFDownBlock</a>
   <a href="#up-detail">5. WFUpBlock</a>
-  <a href="#wavelet-flow">6. Wavelet Flow</a>
-  <a href="#discriminator">7. Discriminator &amp; Loss</a>
+  <a href="#discriminator">6. Discriminator &amp; Loss</a>
 </div>
 
 <div class="container">
@@ -87,14 +86,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 
 <div class="mermaid">
 graph LR
-    subgraph WFVAE2["WFVAE2 32x DCAEFixed"]
+    subgraph ENC["Encoder"]
         direction TB
         I["RGB Input<br/>(B, 3, H, W)"]
-        HWT["HaarWT 2D<br/>3ch &rarr; 12ch, &divide;2"]
+        HWT["HaarWT 2D (W^(1))<br/>3ch &rarr; 12ch, &divide;2<br/>input-side, kept under no-ef"]
         CI["Conv2d 12 &rarr; 256"]
-        DB["4x WFDownBlock<br/>256 &rarr; 512 &rarr; 512 &rarr; 1024 &rarr; 1024<br/>DCAE residual + Wavelet Flow<br/>num_resblocks = [2, 3, 9, 2]"]
+        DB["4x WFDownBlock<br/>256 &rarr; 512 &rarr; 512 &rarr; 1024 &rarr; 1024<br/>DCAE residual + ECA<br/><b>no mid-layer energy flow</b><br/>num_resblocks = [4, 4, 4, 2]"]
         MID["Mid Block<br/>ResBlock &rarr; Attention2DFix &rarr; ResBlock"]
-        CO["GN &rarr; Swish &rarr; Conv 1024 &rarr; 128<br/><b>+ group_avg shortcut (1024→128)</b>"]
+        CO["LayerNorm &rarr; SiLU &rarr; Conv 1024 &rarr; 128<br/><b>+ group_avg shortcut (1024&rarr;128)</b>"]
         Z["z: B, 64, H/32, W/32"]
         I --> HWT --> CI --> DB --> MID --> CO --> Z
         MID -.->|"I/O shortcut"| CO
@@ -103,14 +102,13 @@ graph LR
     subgraph DEC["Decoder"]
         direction TB
         ZI["z: B, 64, H/32, W/32"]
-        DCI["Conv2d 64 &rarr; 1024<br/><b>+ repeat_interleave shortcut (64→1024)</b>"]
+        DCI["Conv2d 64 &rarr; 1024<br/><b>+ repeat_interleave shortcut (64&rarr;1024)</b>"]
         DMID["Mid Block<br/>ResBlock &rarr; Attention2DFix &rarr; ResBlock"]
-        UB["4x WFUpBlock<br/>1024 &rarr; 1024 &rarr; 512 &rarr; 512 &rarr; 256<br/>DCAE residual + Wavelet Flow<br/>num_resblocks = [3, 4, 12, 2]"]
-        DCO["GN &rarr; Swish &rarr; Conv 256 &rarr; 12"]
-        MRG["LL += w wavelet residual"]
-        IWT["InvHaarWT 2D<br/>12ch &rarr; 3ch, x2"]
+        UB["4x WFUpBlock<br/>1024 &rarr; 1024 &rarr; 512 &rarr; 512 &rarr; 256<br/>DCAE residual + ECA<br/><b>no mid-layer energy flow</b><br/>num_resblocks = [5, 5, 5, 3]"]
+        DCO["LayerNorm &rarr; SiLU &rarr; Conv 256 &rarr; 12"]
+        IWT["InvHaarWT 2D (W^(1))<br/>12ch &rarr; 3ch, x2<br/>output-side, kept under no-ef"]
         OUT["RGB Output<br/>(B, 3, H, W)"]
-        ZI --> DCI --> DMID --> UB --> DCO --> MRG --> IWT --> OUT
+        ZI --> DCI --> DMID --> UB --> DCO --> IWT --> OUT
         ZI -.->|"I/O shortcut"| DCI
     end
 
@@ -128,18 +126,29 @@ graph LR
   <div class="summary-card"><div class="label">Spatial Compression</div><div class="val">32x</div></div>
   <div class="summary-card"><div class="label">Latent Channels</div><div class="val">64</div></div>
   <div class="summary-card"><div class="label">Latent 1024px</div><div class="val">64x32x32</div></div>
-  <div class="summary-card"><div class="label">Normalization</div><div class="val">GroupNorm</div></div>
-  <div class="summary-card"><div class="label">Enc ResBlocks</div><div class="val">[2,3,9,2]</div></div>
-  <div class="summary-card"><div class="label">Dec ResBlocks</div><div class="val">[3,4,12,2]</div></div>
-  <div class="summary-card"><div class="label">Params (Enc)</div><div class="val">168.69 M</div></div>
-  <div class="summary-card"><div class="label">Params (Dec)</div><div class="val">309.40 M</div></div>
-  <div class="summary-card"><div class="label">Params (Total)</div><div class="val">478.09 M</div></div>
+  <div class="summary-card"><div class="label">Normalization</div><div class="val">LayerNorm</div></div>
+  <div class="summary-card"><div class="label">Enc ResBlocks</div><div class="val">[4,4,4,2]</div></div>
+  <div class="summary-card"><div class="label">Dec ResBlocks</div><div class="val">[5,5,5,3]</div></div>
+  <div class="summary-card"><div class="label">Params (Enc)</div><div class="val">145.55 M</div></div>
+  <div class="summary-card"><div class="label">Params (Dec)</div><div class="val">322.25 M</div></div>
+  <div class="summary-card"><div class="label">Params (Total)</div><div class="val">467.80 M</div></div>
+  <div class="summary-card"><div class="label">use_energy_flow</div><div class="val" style="color:var(--orange);">false</div></div>
   <div class="summary-card"><div class="label">I/O Shortcut</div><div class="val">Enabled</div></div>
+  <div class="summary-card"><div class="label">ECA Attention</div><div class="val">Enabled</div></div>
   <div class="summary-card"><div class="label">Discriminator</div><div class="val">Multi-scale (num_D=3)</div></div>
-  <div class="summary-card"><div class="label">Disc Params</div><div class="val">8.30 M</div></div>
-  <div class="summary-card"><div class="label">Feat Match λ</div><div class="val">10.0</div></div>
+  <div class="summary-card"><div class="label">Disc Norm</div><div class="val">Spectral Norm</div></div>
   <div class="summary-card"><div class="label">Downsample</div><div class="val">Conv+PixUnshuf</div></div>
   <div class="summary-card"><div class="label">Upsample</div><div class="val">Conv+PixShuf</div></div>
+</div>
+
+<div class="callout">
+<h4>Energy flow switch</h4>
+<ul>
+<li><span class="dm y"></span><strong>What is kept</strong>: <code>W^(1)</code> Haar WT at encoder entry (3&rarr;12ch, &divide;2) and Inv Haar WT at decoder exit (12&rarr;3ch, &times;2). These drive the input-side 2&times; compression and are part of the backbone, not the mid-layer pathway.</li>
+<li><span class="dm r"></span><strong>What is removed</strong> (vs paper WF-VAE): per-stage <code>in_flow_conv</code> / <code>out_flow_conv</code>, the <code>+energy_flow_size</code> channel expansion in <code>branch_conv</code>, the cascading <code>h[:,:3] += w</code> wavelet residual injection, <code>enc_coeffs</code>/<code>dec_coeffs</code> lists, and the WL loss.</li>
+<li><span class="dm c"></span><strong>Code switch</strong>: <code>use_energy_flow=false</code> in <code>examples/wfivae2-image-32x-192bc.json</code>. Flipping to <code>true</code> reproduces the paper form on the same backbone — the code path is preserved. No separate no-ef config ships.</li>
+<li><span class="dm g"></span><strong>Parameter savings</strong>: ~22 M (&minus;4.5%) vs paper DCAE + ef (489.88 M &rarr; 467.80 M). Decoder drops ~15 M (<code>branch_conv</code> channel expansion alone); encoder drops ~7 M (four <code>in_flow_conv</code> removals).</li>
+</ul>
 </div>
 </div>
 </div>
@@ -152,95 +161,71 @@ graph LR
 <div class="mermaid">
 graph TB
     IN["Input RGB (B, 3, 1024, 1024)"]
-    HAAR_E["HaarWaveletTransform2D<br/>4 sub-bands LL,LH,HL,HH x 3 RGB = 12ch<br/>(B, 12, 512, 512)"]
+    HAAR_E["HaarWaveletTransform2D (W^(1))<br/>4 sub-bands LL,LH,HL,HH x 3 RGB = 12ch<br/>(B, 12, 512, 512)"]
     CI["conv_in: Conv2d 12 &rarr; 256, 3x3, s=1<br/>(B, 256, 512, 512)"]
     IN --> HAAR_E --> CI
 
-    subgraph WD0["WFDownBlock 0: 512 &rarr; 256, ch 256 &rarr; 512, num_resblocks=2"]
-        WD0R["res_block: ResBlock x1<br/>256 &rarr; 256, GN+Swish<br/>(B, 256, 512, 512)"]
+    subgraph WD0["WFDownBlock 0: 512 &rarr; 256, ch 256 &rarr; 512, num_resblocks=4"]
+        WD0R["res_block: ResBlock+ECA x3<br/>256 &rarr; 256, LN+Swish+ECA<br/>(B, 256, 512, 512)"]
         WD0SC["DCAE shortcut:<br/>pixel_unshuffle x,2 &rarr; (B, 1024, 256, 256)<br/>reshape B,512,2,H,W .mean dim=2<br/>&rarr; (B, 512, 256, 256)"]
         WD0CV["conv_down: Conv2d 256 &rarr; 128, 3x3, s=1<br/>(B, 128, 512, 512)"]
         WD0PU["F.pixel_unshuffle x,2<br/>(B, 512, 256, 256)"]
         WD0ADD["h + shortcut<br/>(B, 512, 256, 256)"]
-        WD0WT["HaarWT on coeffs0 first3ch LL sub-band<br/>coeffs1: (B, 12, 256, 256)"]
-        WD0FL["in_flow_conv: Conv2d 12 &rarr; 128, 3x3<br/>(B, 128, 256, 256)"]
-        WD0CAT["Concat dim=1: 512 + 128 = 640<br/>(B, 640, 256, 256)"]
-        WD0OUT["out_res_block: ResBlock 640 &rarr; 512, GN+Swish<br/>(B, 512, 256, 256)"]
+        WD0OUT["out_res_block: ResBlock+ECA 512 &rarr; 512<br/>(in=out_ch, no +ef expansion)<br/>(B, 512, 256, 256)"]
     end
     CI --> WD0R --> WD0SC
     WD0R --> WD0CV --> WD0PU --> WD0ADD
     WD0SC -->|"shortcut"| WD0ADD
-    HAAR_E -->|"coeffs0"| WD0WT --> WD0FL
-    WD0ADD --> WD0CAT
-    WD0FL --> WD0CAT
-    WD0CAT --> WD0OUT
+    WD0ADD --> WD0OUT
 
-    subgraph WD1["WFDownBlock 1: 256 &rarr; 128, ch 512 &rarr; 512, num_resblocks=3"]
-        WD1R["res_block: ResBlock x2<br/>512 &rarr; 512, GN+Swish<br/>(B, 512, 256, 256)"]
+    subgraph WD1["WFDownBlock 1: 256 &rarr; 128, ch 512 &rarr; 512, num_resblocks=4"]
+        WD1R["res_block: ResBlock+ECA x3<br/>512 &rarr; 512, LN+Swish+ECA<br/>(B, 512, 256, 256)"]
         WD1SC["DCAE shortcut:<br/>pixel_unshuffle &rarr; (B, 2048, 128, 128)<br/>group_avg 4&rarr;1 &rarr; (B, 512, 128, 128)"]
         WD1CV["conv_down: Conv2d 512 &rarr; 128, 3x3, s=1<br/>(B, 128, 256, 256)"]
         WD1PU["pixel_unshuffle x,2<br/>(B, 512, 128, 128)"]
         WD1ADD["h + shortcut<br/>(B, 512, 128, 128)"]
-        WD1WT["HaarWT on coeffs1 first3ch LL<br/>coeffs2: (B, 12, 128, 128)"]
-        WD1FL["in_flow_conv: Conv 12 &rarr; 128<br/>(B, 128, 128, 128)"]
-        WD1CAT["Concat: 512 + 128 = 640<br/>(B, 640, 128, 128)"]
-        WD1OUT["out_res_block: ResBlock 640 &rarr; 512<br/>(B, 512, 128, 128)"]
+        WD1OUT["out_res_block: ResBlock+ECA 512 &rarr; 512<br/>(B, 512, 128, 128)"]
     end
     WD0OUT --> WD1R --> WD1SC
     WD1R --> WD1CV --> WD1PU --> WD1ADD
     WD1SC -->|"shortcut"| WD1ADD
-    WD0WT -->|"coeffs1 first3ch"| WD1WT --> WD1FL
-    WD1ADD --> WD1CAT
-    WD1FL --> WD1CAT
-    WD1CAT --> WD1OUT
+    WD1ADD --> WD1OUT
 
-    subgraph WD2["WFDownBlock 2: 128 &rarr; 64, ch 512 &rarr; 1024, num_resblocks=9 (heavy)"]
-        WD2R["res_block: ResBlock x8<br/>512 &rarr; 512, GN+Swish<br/>(B, 512, 128, 128)"]
+    subgraph WD2["WFDownBlock 2: 128 &rarr; 64, ch 512 &rarr; 1024, num_resblocks=4"]
+        WD2R["res_block: ResBlock+ECA x3<br/>512 &rarr; 512, LN+Swish+ECA<br/>(B, 512, 128, 128)"]
         WD2SC["DCAE shortcut:<br/>pixel_unshuffle &rarr; (B, 2048, 64, 64)<br/>group_avg 2&rarr;1 &rarr; (B, 1024, 64, 64)"]
         WD2CV["conv_down: Conv2d 512 &rarr; 256, 3x3, s=1<br/>(B, 256, 128, 128)"]
         WD2PU["pixel_unshuffle x,2<br/>(B, 1024, 64, 64)"]
         WD2ADD["h + shortcut<br/>(B, 1024, 64, 64)"]
-        WD2WT["HaarWT on coeffs2 first3ch LL<br/>coeffs3: (B, 12, 64, 64)"]
-        WD2FL["in_flow_conv: Conv 12 &rarr; 128<br/>(B, 128, 64, 64)"]
-        WD2CAT["Concat: 1024 + 128 = 1152<br/>(B, 1152, 64, 64)"]
-        WD2OUT["out_res_block: ResBlock 1152 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+        WD2OUT["out_res_block: ResBlock+ECA 1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
     end
     WD1OUT --> WD2R --> WD2SC
     WD2R --> WD2CV --> WD2PU --> WD2ADD
     WD2SC -->|"shortcut"| WD2ADD
-    WD1WT -->|"coeffs2 first3ch"| WD2WT --> WD2FL
-    WD2ADD --> WD2CAT
-    WD2FL --> WD2CAT
-    WD2CAT --> WD2OUT
+    WD2ADD --> WD2OUT
 
     subgraph WD3["WFDownBlock 3: 64 &rarr; 32, ch 1024 &rarr; 1024, num_resblocks=2"]
-        WD3R["res_block: ResBlock x1<br/>1024 &rarr; 1024, GN+Swish<br/>(B, 1024, 64, 64)"]
+        WD3R["res_block: ResBlock+ECA x1<br/>1024 &rarr; 1024, LN+Swish+ECA<br/>(B, 1024, 64, 64)"]
         WD3SC["DCAE shortcut:<br/>pixel_unshuffle &rarr; (B, 4096, 32, 32)<br/>group_avg 4&rarr;1 &rarr; (B, 1024, 32, 32)"]
         WD3CV["conv_down: Conv2d 1024 &rarr; 256, 3x3, s=1<br/>(B, 256, 64, 64)"]
         WD3PU["pixel_unshuffle x,2<br/>(B, 1024, 32, 32)"]
         WD3ADD["h + shortcut<br/>(B, 1024, 32, 32)"]
-        WD3WT["HaarWT on coeffs3 first3ch LL<br/>coeffs4: (B, 12, 32, 32)"]
-        WD3FL["in_flow_conv: Conv 12 &rarr; 128<br/>(B, 128, 32, 32)"]
-        WD3CAT["Concat: 1024 + 128 = 1152<br/>(B, 1152, 32, 32)"]
-        WD3OUT["out_res_block: ResBlock 1152 &rarr; 1024<br/>(B, 1024, 32, 32)"]
+        WD3OUT["out_res_block: ResBlock+ECA 1024 &rarr; 1024<br/>(B, 1024, 32, 32)"]
     end
     WD2OUT --> WD3R --> WD3SC
     WD3R --> WD3CV --> WD3PU --> WD3ADD
     WD3SC -->|"shortcut"| WD3ADD
-    WD2WT -->|"coeffs3 first3ch"| WD3WT --> WD3FL
-    WD3ADD --> WD3CAT
-    WD3FL --> WD3CAT
-    WD3CAT --> WD3OUT
+    WD3ADD --> WD3OUT
 
     subgraph MID_E["Mid Block 1024ch"]
-        EM1["ResnetBlock2D 1024 &rarr; 1024, GN+Swish"]
-        EA["Attention2DFix: GN &rarr; QKV 1x1 Conv &rarr; SDPA &rarr; proj_out"]
-        EM2["ResnetBlock2D 1024 &rarr; 1024, GN+Swish"]
+        EM1["ResnetBlock2D+ECA 1024 &rarr; 1024, LN+Swish+ECA"]
+        EA["Attention2DFix: LN &rarr; QKV 1x1 Conv &rarr; SDPA &rarr; proj_out"]
+        EM2["ResnetBlock2D+ECA 1024 &rarr; 1024, LN+Swish+ECA"]
     end
     WD3OUT --> EM1 --> EA --> EM2
 
     subgraph OUT_IO["Encoder Output + I/O Shortcut"]
-        NORM_E["GroupNorm &rarr; Swish"]
+        NORM_E["LayerNorm &rarr; Swish"]
         CONV_E["Conv2d 1024 &rarr; 128, 3x3<br/>(B, 128, 32, 32)"]
         SHORTCUT_E["_out_shortcut (non-parametric):<br/>h.reshape(B, 128, 8, 32, 32).mean(dim=2)<br/>(B, 128, 32, 32)"]
         ADD_E["h + shortcut<br/>(B, 128, 32, 32)"]
@@ -262,13 +247,15 @@ graph TB
 <div class="callout">
 <h4>Encoder Key Points</h4>
 <ul>
-<li><span class="dm g"></span><strong>DCAE-aligned spatial transition</strong>: Conv(in, out/4, s=1) + pixel_unshuffle(2). Shortcut: pixel_unshuffle + channel_avg. Both share same spatial rearrangement.</li>
-<li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_down + pixel_unshuffle, matching DC-AE. Wavelet concat + out_res_block are OUTSIDE residual.</li>
-<li><span class="dm y"></span><strong>Cascading wavelet</strong>: Each block takes LL sub-band (first 3ch) of previous coefficients, applies HaarWT to get next-level coefficients.</li>
-<li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>encoder_num_resblocks=[2,3,9,2]</code>, so <code>res_block</code> has <code>num-1</code> ResBlocks before spatial transition, then +1 <code>out_res_block</code> after wavelet concat. Total per stage: 2,3,9,2. Heavy middle at Down2 (9), thin edges at Down0/Down3 (2).</li>
-<li><span class="dm g"></span><strong>I/O shortcut (new)</strong>: Non-parametric group-average shortcut from mid-block output bypasses <code>norm_out → swish → conv_out</code>. Formula: <code>h.reshape(B, 2*latent_dim, C//(2*latent_dim), H, W).mean(dim=2)</code> then added to <code>conv_out</code> result. HunyuanVAE-aligned. Gated by <code>use_io_shortcut=True</code>.</li>
+<li><span class="dm y"></span><strong>W^(1) HaarWT is retained</strong>: the input-side Haar wavelet transform is part of the backbone (drives 2&times; compression), not the removed mid-layer energy flow. It fires once per encoder call, turning 3ch RGB into 12ch at half spatial resolution.</li>
+<li><span class="dm r"></span><strong>No mid-layer energy flow</strong>: each <code>WFDownBlock</code> no longer runs <code>wavelet_transform(w[:,:3])</code>, <code>in_flow_conv</code>, or a concat. The trunk goes <code>res_block &rarr; (conv_down + pixel_unshuffle + DCAE shortcut) &rarr; out_res_block</code> directly, and <code>out_res_block.in_channels = out_ch</code> (not <code>out_ch + ef</code>). <code>Encoder.forward</code> returns <code>(h, None)</code>.</li>
+<li><span class="dm g"></span><strong>DCAE-aligned spatial transition</strong>: Conv(in, out/4, s=1) + pixel_unshuffle(2). Shortcut: pixel_unshuffle + channel_avg. Both share the same spatial rearrangement.</li>
+<li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_down + pixel_unshuffle. <code>out_res_block</code> processes shortcut-enhanced features OUTSIDE the residual.</li>
+<li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>encoder_num_resblocks=[4,4,4,2]</code> &mdash; 4 ResBlocks at Down0/1/2, only 2 at Down3 (pre-spatial <code>res_block</code> has <code>num-1</code>, plus 1 <code>out_res_block</code>).</li>
+<li><span class="dm g"></span><strong>ECA channel attention</strong>: every <code>ResnetBlock2D</code> ends with <code>ECALayer(C)</code> before the residual add (Wang et al. CVPR 2020). Adaptive kernel <code>k = |log2(C)/2 + 0.5|_odd</code>. At C &isin; {256, 512, 1024} k=5, ~5 params per block.</li>
+<li><span class="dm g"></span><strong>I/O shortcut</strong>: non-parametric group-average shortcut from mid-block output bypasses <code>norm_out &rarr; swish &rarr; conv_out</code>. Formula: <code>h.reshape(B, 2*latent_dim, C//(2*latent_dim), H, W).mean(dim=2)</code>. HunyuanVAE-aligned.</li>
 </ul>
-<p class="src-ref">Source: modeling_wfvae2.py Encoder L142-220, WFDownBlock L25-80</p>
+<p class="src-ref">Source: modeling_wfvae2.py <code>Encoder</code> and <code>WFDownBlock</code></p>
 </div>
 </div>
 </div>
@@ -291,101 +278,73 @@ graph TB
     Z_IN -->|"repeat bypass"| SHORTCUT_D --> ADD_D
 
     subgraph MID_D["Mid Block 1024ch"]
-        DM1["ResnetBlock2D 1024, GN+Swish"]
-        DA["Attention2DFix: GN &rarr; QKV &rarr; SDPA &rarr; proj"]
-        DM2["ResnetBlock2D 1024, GN+Swish"]
+        DM1["ResnetBlock2D+ECA 1024, LN+Swish+ECA"]
+        DA["Attention2DFix: LN &rarr; QKV &rarr; SDPA &rarr; proj"]
+        DM2["ResnetBlock2D+ECA 1024, LN+Swish+ECA"]
     end
     ADD_D --> DM1 --> DA --> DM2
 
-    subgraph WU0["WFUpBlock 0: 32 &rarr; 64, ch 1024 &rarr; 1024, num_resblocks=3"]
-        WU0B["branch_conv: ResBlock 1024 &rarr; 1152, GN+Swish<br/>(B, 1152, 32, 32)"]
-        WU0SP["Split: main = x first1024ch, flow = x last128ch"]
-        WU0FC["out_flow_conv:<br/>ResBlock 128 &rarr; 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 32, 32)"]
-        WU0IW["w = None, skip injection<br/>InvHaarWT coeffs &rarr; w0: (B, 3, 64, 64)"]
-        WU0MR["res_block: ResBlock x1<br/>1024 &rarr; 1024, GN+Swish<br/>(B, 1024, 32, 32)"]
+    subgraph WU0["WFUpBlock 0: 32 &rarr; 64, ch 1024 &rarr; 1024, num_resblocks=5"]
+        WU0B["branch_conv: ResBlock+ECA 1024 &rarr; 1024<br/>(in=in_ch, no +ef expansion)<br/>(B, 1024, 32, 32)"]
+        WU0MR["res_block: ResBlock+ECA x3<br/>1024 &rarr; 1024, LN+Swish+ECA<br/>(B, 1024, 32, 32)"]
         WU0SC["DCAE shortcut:<br/>repeat_interleave 4 &rarr; (B, 4096, 32, 32)<br/>pixel_shuffle 2 &rarr; (B, 1024, 64, 64)"]
         WU0CV["conv_up: Conv2d 1024 &rarr; 4096, 3x3, s=1<br/>(B, 4096, 32, 32)"]
         WU0PS["F.pixel_shuffle x,2<br/>(B, 1024, 64, 64)"]
         WU0ADD["h + shortcut<br/>(B, 1024, 64, 64)"]
-        WU0OR["out_res_block: ResBlock 1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+        WU0OR["out_res_block: ResBlock+ECA 1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
     end
-    DM2 --> WU0B --> WU0SP
-    WU0SP -->|"flow 128ch"| WU0FC --> WU0IW
-    WU0SP -->|"main 1024ch"| WU0MR --> WU0SC
+    DM2 --> WU0B --> WU0MR --> WU0SC
     WU0MR --> WU0CV --> WU0PS --> WU0ADD
     WU0SC -->|"shortcut"| WU0ADD
     WU0ADD --> WU0OR
 
-    subgraph WU1["WFUpBlock 1: 64 &rarr; 128, ch 1024 &rarr; 512, num_resblocks=4"]
-        WU1B["branch_conv: ResBlock 1024 &rarr; 1152<br/>(B, 1152, 64, 64)"]
-        WU1SP["Split: main = x first1024ch, flow = x last128ch"]
-        WU1FC["out_flow_conv:<br/>ResBlock 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 64, 64)"]
-        WU1INJ["coeffs first3ch += w0<br/>inject LL sub-band from prev level"]
-        WU1IW["InvHaarWT coeffs &rarr; w1: (B, 3, 128, 128)"]
-        WU1MR["res_block: ResBlock x2<br/>1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+    subgraph WU1["WFUpBlock 1: 64 &rarr; 128, ch 1024 &rarr; 512, num_resblocks=5"]
+        WU1B["branch_conv: ResBlock+ECA 1024 &rarr; 1024<br/>(B, 1024, 64, 64)"]
+        WU1MR["res_block: ResBlock+ECA x3<br/>1024 &rarr; 1024, +ECA<br/>(B, 1024, 64, 64)"]
         WU1SC["DCAE shortcut:<br/>repeat_interleave 2 + pixel_shuffle 2<br/>(B, 512, 128, 128)"]
         WU1CV["conv_up: Conv2d 1024 &rarr; 2048, 3x3, s=1<br/>(B, 2048, 64, 64)"]
         WU1PS["pixel_shuffle x,2<br/>(B, 512, 128, 128)"]
         WU1ADD["h + shortcut<br/>(B, 512, 128, 128)"]
-        WU1OR["out_res_block: ResBlock 512 &rarr; 512<br/>(B, 512, 128, 128)"]
+        WU1OR["out_res_block: ResBlock+ECA 512 &rarr; 512<br/>(B, 512, 128, 128)"]
     end
-    WU0OR --> WU1B --> WU1SP
-    WU0IW -->|"w0"| WU1INJ
-    WU1SP -->|"flow 128ch"| WU1FC --> WU1INJ --> WU1IW
-    WU1SP -->|"main 1024ch"| WU1MR --> WU1SC
+    WU0OR --> WU1B --> WU1MR --> WU1SC
     WU1MR --> WU1CV --> WU1PS --> WU1ADD
     WU1SC -->|"shortcut"| WU1ADD
     WU1ADD --> WU1OR
 
-    subgraph WU2["WFUpBlock 2: 128 &rarr; 256, ch 512 &rarr; 512, num_resblocks=12 (heavy)"]
-        WU2B["branch_conv: ResBlock 512 &rarr; 640<br/>(B, 640, 128, 128)"]
-        WU2SP["Split: main = x first512ch, flow = x last128ch"]
-        WU2FC["out_flow_conv:<br/>ResBlock 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 128, 128)"]
-        WU2INJ["coeffs first3ch += w1"]
-        WU2IW["InvHaarWT coeffs &rarr; w2: (B, 3, 256, 256)"]
-        WU2MR["res_block: ResBlock x10<br/>512 &rarr; 512<br/>(B, 512, 128, 128)"]
+    subgraph WU2["WFUpBlock 2: 128 &rarr; 256, ch 512 &rarr; 512, num_resblocks=5"]
+        WU2B["branch_conv: ResBlock+ECA 512 &rarr; 512<br/>(B, 512, 128, 128)"]
+        WU2MR["res_block: ResBlock+ECA x3<br/>512 &rarr; 512, +ECA<br/>(B, 512, 128, 128)"]
         WU2SC["DCAE shortcut:<br/>repeat_interleave 4 + pixel_shuffle 2<br/>(B, 512, 256, 256)"]
         WU2CV["conv_up: Conv2d 512 &rarr; 2048, 3x3, s=1<br/>(B, 2048, 128, 128)"]
         WU2PS["pixel_shuffle x,2<br/>(B, 512, 256, 256)"]
         WU2ADD["h + shortcut<br/>(B, 512, 256, 256)"]
-        WU2OR["out_res_block: ResBlock 512 &rarr; 512<br/>(B, 512, 256, 256)"]
+        WU2OR["out_res_block: ResBlock+ECA 512 &rarr; 512<br/>(B, 512, 256, 256)"]
     end
-    WU1OR --> WU2B --> WU2SP
-    WU1IW -->|"w1"| WU2INJ
-    WU2SP -->|"flow 128ch"| WU2FC --> WU2INJ --> WU2IW
-    WU2SP -->|"main 512ch"| WU2MR --> WU2SC
+    WU1OR --> WU2B --> WU2MR --> WU2SC
     WU2MR --> WU2CV --> WU2PS --> WU2ADD
     WU2SC -->|"shortcut"| WU2ADD
     WU2ADD --> WU2OR
 
-    subgraph WU3["WFUpBlock 3: 256 &rarr; 512, ch 512 &rarr; 256, num_resblocks=2"]
-        WU3B["branch_conv: ResBlock 512 &rarr; 640<br/>(B, 640, 256, 256)"]
-        WU3SP["Split: main = x first512ch, flow = x last128ch"]
-        WU3FC["out_flow_conv:<br/>ResBlock 128 + Conv 128 &rarr; 12<br/>coeffs: (B, 12, 256, 256)"]
-        WU3INJ["coeffs first3ch += w2"]
-        WU3IW["InvHaarWT coeffs &rarr; w3: (B, 3, 512, 512)"]
-        WU3MR["res_block: empty (num-2=0)<br/>pass-through (B, 512, 256, 256)"]
+    subgraph WU3["WFUpBlock 3: 256 &rarr; 512, ch 512 &rarr; 256, num_resblocks=3"]
+        WU3B["branch_conv: ResBlock+ECA 512 &rarr; 512<br/>(B, 512, 256, 256)"]
+        WU3MR["res_block: ResBlock+ECA x1<br/>512 &rarr; 512, +ECA<br/>(B, 512, 256, 256)"]
         WU3SC["DCAE shortcut:<br/>repeat_interleave 2 + pixel_shuffle 2<br/>(B, 256, 512, 512)"]
         WU3CV["conv_up: Conv2d 512 &rarr; 1024, 3x3, s=1<br/>(B, 1024, 256, 256)"]
         WU3PS["pixel_shuffle x,2<br/>(B, 256, 512, 512)"]
         WU3ADD["h + shortcut<br/>(B, 256, 512, 512)"]
-        WU3OR["out_res_block: ResBlock 256 &rarr; 256<br/>(B, 256, 512, 512)"]
+        WU3OR["out_res_block: ResBlock+ECA 256 &rarr; 256<br/>(B, 256, 512, 512)"]
     end
-    WU2OR --> WU3B --> WU3SP
-    WU2IW -->|"w2"| WU3INJ
-    WU3SP -->|"flow 128ch"| WU3FC --> WU3INJ --> WU3IW
-    WU3SP -->|"main 512ch"| WU3MR --> WU3SC
+    WU2OR --> WU3B --> WU3MR --> WU3SC
     WU3MR --> WU3CV --> WU3PS --> WU3ADD
     WU3SC -->|"shortcut"| WU3ADD
     WU3ADD --> WU3OR
 
-    NORM_D["GroupNorm &rarr; Swish"]
+    NORM_D["LayerNorm &rarr; Swish"]
     CONV_D["Conv2d 256 &rarr; 12, 3x3<br/>(B, 12, 512, 512)"]
-    MERGE["h first3ch += w3<br/>inject LL wavelet residual from last WFUpBlock"]
-    INV_HAAR["InverseHaarWaveletTransform2D<br/>12ch &rarr; 3ch, 512 &rarr; 1024"]
+    INV_HAAR["InverseHaarWaveletTransform2D (W^(1))<br/>12ch &rarr; 3ch, 512 &rarr; 1024"]
     OUTPUT["Output RGB (B, 3, 1024, 1024)"]
-    WU3OR --> NORM_D --> CONV_D --> MERGE --> INV_HAAR --> OUTPUT
-    WU3IW -->|"w3"| MERGE
+    WU3OR --> NORM_D --> CONV_D --> INV_HAAR --> OUTPUT
 
     style Z_IN fill:#2d1040,stroke:#bc8cff,color:#fff
     style OUTPUT fill:#2d1f4e,stroke:#bc8cff,color:#fff
@@ -398,14 +357,15 @@ graph TB
 <div class="callout">
 <h4>Decoder Key Points</h4>
 <ul>
-<li><span class="dm g"></span><strong>DCAE-aligned spatial transition</strong>: Conv(in, out*4, s=1) + pixel_shuffle(2). Shortcut: repeat_interleave + pixel_shuffle. Both share same spatial rearrangement.</li>
-<li><span class="dm c"></span><strong>Residual scope</strong>: shortcut wraps ONLY conv_up + pixel_shuffle, matching DC-AE. out_res_block is OUTSIDE residual.</li>
-<li><span class="dm y"></span><strong>Cascading wavelet reconstruction</strong>: Each WFUpBlock generates wavelet coefficients, injects previous level LL into current coefficients, then InvHaarWT produces RGB residual <code>w</code> at progressively larger resolutions.</li>
-<li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>decoder_num_resblocks=[3,4,12,2]</code>, so <code>res_block</code> has <code>num-2</code> ResBlocks (1, 2, 10, 0) in main trunk after branch split. Total per stage = num counting branch_conv + res_block + out_res_block. Heavy middle at Up2 (12 blocks).</li>
-<li><span class="dm g"></span><strong>I/O shortcut (new)</strong>: Non-parametric <code>repeat_interleave</code> shortcut from latent <code>z</code> bypasses <code>conv_in</code>. Formula: <code>z.repeat_interleave(base_channels[-1]//latent_dim, dim=1)</code> — for current config, 64→1024 via 16× channel duplication. HunyuanVAE-aligned. Gated by <code>use_io_shortcut=True</code>.</li>
-<li><span class="dm r"></span><strong>No encoder skip connections</strong>: Decoder is fully independent, all information comes from latent <code>z</code>.</li>
+<li><span class="dm y"></span><strong>W^(1) InvHaarWT is retained</strong>: output-side inverse Haar wavelet transforms the 12ch feature map back into 3ch RGB at 2&times; resolution. Part of the backbone; not tied to energy-flow toggling.</li>
+<li><span class="dm r"></span><strong>No mid-layer energy flow</strong>: <code>branch_conv</code> keeps channels at <code>in_ch</code> (no <code>+128</code> expansion). No split, no <code>out_flow_conv</code>, no per-stage <code>InverseHaarWaveletTransform2D</code>, no <code>coeffs[:,:3] += w</code> injection, no final <code>h[:,:3] += w</code> before the output IWT. <code>Decoder.forward</code> returns <code>(dec, None)</code>.</li>
+<li><span class="dm g"></span><strong>DCAE-aligned spatial transition</strong>: Conv(in, out*4, s=1) + pixel_shuffle(2). Shortcut: repeat_interleave + pixel_shuffle. Addition happens immediately after spatial expansion.</li>
+<li><span class="dm r"></span><strong>Per-stage depth</strong>: <code>decoder_num_resblocks=[5,5,5,3]</code> &mdash; 5 ResBlocks at Up0/1/2, only 3 at Up3. Main-trunk <code>res_block</code> has <code>num-2</code> ResBlocks (3,3,3,<strong>1</strong>), plus 1 <code>branch_conv</code> + 1 <code>out_res_block</code>. Up3 was shallowed because its middle ResBlocks run at 512ch &times; 256&sup2; &mdash; the single largest activation footprint in the whole decoder.</li>
+<li><span class="dm g"></span><strong>ECA channel attention</strong>: every decoder <code>ResnetBlock2D</code> (including <code>branch_conv</code>, main-trunk <code>res_block</code>, <code>out_res_block</code>, and mid <code>ResnetBlock2D</code>) ends with <code>ECALayer(C)</code> &mdash; ~5 params each.</li>
+<li><span class="dm g"></span><strong>I/O shortcut</strong>: non-parametric <code>repeat_interleave</code> shortcut from latent <code>z</code> bypasses <code>conv_in</code>. Formula: <code>z.repeat_interleave(base_channels[-1]//latent_dim, dim=1)</code> &mdash; for current config, 64&rarr;1024 via 16&times; channel duplication. HunyuanVAE-aligned.</li>
+<li><span class="dm r"></span><strong>No encoder skip connections</strong>: decoder is fully independent, all information comes from latent <code>z</code>.</li>
 </ul>
-<p class="src-ref">Source: modeling_wfvae2.py Decoder L209-292, WFUpBlock L82-139</p>
+<p class="src-ref">Source: modeling_wfvae2.py <code>Decoder</code> and <code>WFUpBlock</code></p>
 </div>
 </div>
 </div>
@@ -417,14 +377,9 @@ graph TB
 
 <div class="mermaid">
 graph TB
-    subgraph INPUT["Inputs"]
-        X["x: (B, in_ch, H, W) spatial features"]
-        W["w: (B, 12, H, W) wavelet coefficients from prev level"]
-    end
+    X["Input x: (B, in_ch, H, W)"]
 
-    subgraph RESBLOCKS["Pre-spatial ResBlocks num_resblocks - 1"]
-        RB["ResBlock x N-1<br/>GroupNorm &rarr; Swish &rarr; Conv in_ch,in_ch,3x3<br/>&rarr; GroupNorm &rarr; Swish &rarr; Conv in_ch,in_ch,3x3<br/>+ identity shortcut<br/>(B, in_ch, H, W)"]
-    end
+    RB["res_block: ResBlock+ECA x(num_rb-1)<br/>LayerNorm &rarr; Swish &rarr; Conv in_ch,in_ch,3x3<br/>&rarr; LayerNorm &rarr; Swish &rarr; Conv in_ch,in_ch,3x3<br/>+ identity shortcut + ECALayer<br/>(B, in_ch, H, W)"]
     X --> RB
 
     subgraph DCAE_RES["DCAE Residual Block: wraps spatial transition only"]
@@ -438,39 +393,27 @@ graph TB
     RB --> SC
     RB --> MAIN_CV
 
-    subgraph WF["Wavelet Energy Flow"]
-        WT["HaarWaveletTransform2D w first3ch<br/>LL sub-band 3ch &rarr; 12ch at H/2<br/>coeffs: (B, 12, H/2, W/2)"]
-        FL["in_flow_conv: Conv2d 12 &rarr; efs, 3x3<br/>(B, efs, H/2, W/2)"]
-    end
-    W --> WT --> FL
+    OUT_RB["out_res_block: ResBlock+ECA out_ch &rarr; out_ch<br/>(in_channels = out_ch, <b>no +ef concat</b> under use_energy_flow=false)<br/>(B, out_ch, H/2, W/2)"]
+    DCAE_ADD --> OUT_RB
 
-    CAT["Concat h, flow dim=1<br/>(B, out_ch + efs, H/2, W/2)"]
-    DCAE_ADD --> CAT
-    FL --> CAT
-
-    OUT_RB["out_res_block: ResBlock out_ch+efs &rarr; out_ch<br/>GN &rarr; Swish &rarr; Conv &rarr; GN &rarr; Swish &rarr; Conv<br/>+ nin_shortcut 1x1 Conv since in != out<br/>(B, out_ch, H/2, W/2)"]
-    CAT --> OUT_RB
-
-    subgraph OUTPUT["Outputs"]
-        HOUT["h: (B, out_ch, H/2, W/2)"]
-        COUT["coeffs: (B, 12, H/2, W/2) passed to next WFDownBlock"]
-    end
+    HOUT["Output h: (B, out_ch, H/2, W/2)<br/><i>forward returns (h, None) — no inter_coeffs</i>"]
     OUT_RB --> HOUT
-    WT --> COUT
 
+    style X fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style HOUT fill:#2d1040,stroke:#bc8cff,color:#fff
     style SC fill:#1a2e1a,stroke:#3fb950,color:#fff
     style DCAE_ADD fill:#1a2e1a,stroke:#3fb950,color:#fff
-    style WT fill:#3d1a4e,stroke:#d29922,color:#fff
-    style FL fill:#3d1a4e,stroke:#d29922,color:#fff
 </div>
 
 <div class="callout">
 <h4>WFDownBlock Design</h4>
 <ul>
-<li><span class="dm g"></span><strong>DCAE residual alignment</strong>: Both paths use pixel_unshuffle for spatial rearrangement. Conv operates at ORIGINAL resolution before pixel_unshuffle, seeing full spatial context.</li>
-<li><span class="dm c"></span><strong>Minimal residual scope</strong>: Shortcut wraps ONLY conv_down + pixel_unshuffle. Wavelet concat and out_res_block process shortcut-enhanced features OUTSIDE residual.</li>
-<li><span class="dm y"></span><strong>Wavelet energy flow</strong>: Cascading HaarWT on LL sub-band produces multi-level frequency decomposition. Flow is concatenated not added to main trunk, then fused by out_res_block.</li>
+<li><span class="dm g"></span><strong>DCAE residual alignment</strong>: both paths use pixel_unshuffle for spatial rearrangement. Conv operates at ORIGINAL resolution before pixel_unshuffle, seeing full spatial context.</li>
+<li><span class="dm c"></span><strong>Minimal residual scope</strong>: shortcut wraps ONLY <code>conv_down + pixel_unshuffle</code>. <code>out_res_block</code> processes shortcut-enhanced features OUTSIDE the residual.</li>
+<li><span class="dm r"></span><strong>No mid-layer energy flow</strong>: there is no <code>HaarWaveletTransform2D</code> call inside this block, no <code>in_flow_conv</code>, no concat. The trunk becomes a clean <code>res_block &rarr; DCAE spatial transition &rarr; out_res_block</code> pipeline. <code>out_res_block.in_channels = out_ch</code> (not <code>out_ch + ef</code>).</li>
+<li><span class="dm y"></span><strong>forward signature</strong>: kept as <code>forward(x, w=None)</code> for interface symmetry with the ef=true code path. Returns <code>(h, None)</code> under use_energy_flow=false.</li>
 </ul>
+<p class="src-ref">Source: <code>WFDownBlock</code> in modeling_wfvae2.py</p>
 </div>
 </div>
 </div>
@@ -482,164 +425,72 @@ graph TB
 
 <div class="mermaid">
 graph TB
-    subgraph INPUT["Inputs"]
-        X["x: (B, in_ch, H, W) spatial features"]
-        W["w: (B, 3, 2H, 2W) or None, wavelet residual from prev WFUpBlock"]
-    end
+    X["Input x: (B, in_ch, H, W)"]
 
-    BRANCH["branch_conv: ResBlock in_ch &rarr; in_ch + efs<br/>GN &rarr; Swish &rarr; Conv &rarr; GN &rarr; Swish &rarr; Conv + nin_shortcut<br/>(B, in_ch + efs, H, W)"]
+    BRANCH["branch_conv: ResBlock+ECA in_ch &rarr; in_ch<br/>LayerNorm &rarr; Swish &rarr; Conv &rarr; LayerNorm &rarr; Swish &rarr; Conv + identity shortcut<br/>(in_ch = in_ch, <b>no +ef expansion</b> under use_energy_flow=false)<br/>(B, in_ch, H, W)"]
     X --> BRANCH
 
-    SPLIT["Split along channel dim"]
-    BRANCH --> SPLIT
+    MAIN_RB["res_block: ResBlock+ECA x(num_rb-2)<br/>in_ch &rarr; in_ch, LN+Swish+ECA<br/>(B, in_ch, H, W)"]
+    BRANCH --> MAIN_RB
 
-    subgraph FLOW["Wavelet Energy Flow Path"]
-        direction TB
-        FLOW_IN["flow = x last efs channels<br/>(B, efs, H, W)"]
-        FLOW_CONV["out_flow_conv:<br/>ResBlock efs &rarr; efs + Conv2d efs &rarr; 12, 3x3<br/>coeffs: (B, 12, H, W)"]
-        INJECT["coeffs first3ch += w<br/>inject previous level LL residual<br/>skip if w is None"]
-        IWT["InverseHaarWaveletTransform2D coeffs<br/>12ch &rarr; 3ch, H &rarr; 2H<br/>w_out: (B, 3, 2H, 2W)"]
+    subgraph DCAE_RES["DCAE Residual Block"]
+        SC["Shortcut path non-parametric:<br/>repeat_interleave out_ch*4/in_ch<br/>&rarr; (B, out_ch*4, H, W)<br/>pixel_shuffle 2 &rarr; (B, out_ch, 2H, 2W)"]
+        UP_CV["Main path parametric:<br/>conv_up: Conv2d in_ch &rarr; out_ch*4, 3x3, s=1<br/>(B, out_ch*4, H, W)"]
+        UP_PS["pixel_shuffle x,2<br/>(B, out_ch, 2H, 2W)"]
+        UP_ADD["h + shortcut<br/>(B, out_ch, 2H, 2W)"]
+        UP_CV --> UP_PS --> UP_ADD
+        SC -->|"shortcut"| UP_ADD
     end
-    SPLIT -->|"last efs channels"| FLOW_IN --> FLOW_CONV --> INJECT --> IWT
-    W -->|"w from prev block"| INJECT
+    MAIN_RB --> SC
+    MAIN_RB --> UP_CV
 
-    subgraph MAIN["Main Spatial Path"]
-        direction TB
-        MAIN_IN["main = x first in_ch channels<br/>(B, in_ch, H, W)"]
-        MAIN_RB["res_block: ResBlock x N-2<br/>in_ch &rarr; in_ch, GN+Swish<br/>(B, in_ch, H, W)"]
-
-        subgraph DCAE_RES["DCAE Residual Block"]
-            SC["Shortcut path non-parametric:<br/>repeat_interleave out_ch*4/in_ch<br/>&rarr; (B, out_ch*4, H, W)<br/>pixel_shuffle 2 &rarr; (B, out_ch, 2H, 2W)"]
-            UP_CV["Main path parametric:<br/>conv_up: Conv2d in_ch &rarr; out_ch*4, 3x3, s=1<br/>(B, out_ch*4, H, W)"]
-            UP_PS["pixel_shuffle x,2<br/>(B, out_ch, 2H, 2W)"]
-            UP_ADD["h + shortcut<br/>(B, out_ch, 2H, 2W)"]
-            UP_CV --> UP_PS --> UP_ADD
-            SC -->|"shortcut"| UP_ADD
-        end
-        MAIN_IN --> MAIN_RB --> SC
-        MAIN_RB --> UP_CV
-    end
-    SPLIT -->|"first in_ch channels"| MAIN_IN
-
-    OUT_RB["out_res_block: ResBlock out_ch &rarr; out_ch<br/>GN &rarr; Swish &rarr; Conv &rarr; GN &rarr; Swish &rarr; Conv + identity shortcut<br/>(B, out_ch, 2H, 2W)"]
+    OUT_RB["out_res_block: ResBlock+ECA out_ch &rarr; out_ch<br/>LN &rarr; Swish &rarr; Conv &rarr; LN &rarr; Swish &rarr; Conv + identity shortcut<br/>(B, out_ch, 2H, 2W)"]
     UP_ADD --> OUT_RB
 
-    subgraph OUTPUT["Outputs"]
-        HOUT["h: (B, out_ch, 2H, 2W)"]
-        WOUT["w: (B, 3, 2H, 2W) passed to next WFUpBlock or final merge"]
-        COEFFOUT["coeffs: (B, 12, H, W) for wavelet loss"]
-    end
+    HOUT["Output h: (B, out_ch, 2H, 2W)<br/><i>forward returns (h, None, None) — no w / coeffs</i>"]
     OUT_RB --> HOUT
-    IWT --> WOUT
-    FLOW_CONV --> COEFFOUT
 
+    style X fill:#2d1f4e,stroke:#bc8cff,color:#fff
+    style HOUT fill:#2d1040,stroke:#bc8cff,color:#fff
     style SC fill:#1a2e1a,stroke:#3fb950,color:#fff
     style UP_ADD fill:#1a2e1a,stroke:#3fb950,color:#fff
-    style FLOW_IN fill:#3d1a4e,stroke:#d29922,color:#fff
-    style FLOW_CONV fill:#3d1a4e,stroke:#d29922,color:#fff
-    style IWT fill:#3d1a4e,stroke:#d29922,color:#fff
-    style INJECT fill:#3d1a4e,stroke:#d29922,color:#fff
 </div>
 
 <div class="callout">
 <h4>WFUpBlock Design</h4>
 <ul>
-<li><span class="dm g"></span><strong>DCAE residual alignment</strong>: Both paths use pixel_shuffle for spatial rearrangement. Addition happens IMMEDIATELY after spatial expansion.</li>
-<li><span class="dm c"></span><strong>Branch-then-split</strong>: <code>branch_conv</code> expands channels to in_ch + efs, then splits. Model learns how to partition information between spatial path and wavelet flow.</li>
-<li><span class="dm y"></span><strong>Cascading wavelet reconstruction</strong>: Each block generates 12-channel wavelet coefficients, injects previous level LL residual <code>w</code> into first 3 channels, then InvHaarWT produces next RGB residual at 2x resolution.</li>
-<li><span class="dm r"></span><strong>out_res_block identity shortcut</strong>: After DCAE addition, in_ch == out_ch for this ResBlock since pixel_shuffle already mapped to out_ch. No channel projection needed.</li>
+<li><span class="dm g"></span><strong>DCAE residual alignment</strong>: both paths use pixel_shuffle for spatial rearrangement. Addition happens IMMEDIATELY after spatial expansion.</li>
+<li><span class="dm r"></span><strong>No mid-layer energy flow</strong>: <code>branch_conv</code> keeps channels at <code>in_ch</code> (no <code>+128</code> expansion), there is no split, no <code>out_flow_conv</code>, and no <code>InverseHaarWaveletTransform2D</code>. The trunk becomes <code>branch_conv &rarr; res_block &rarr; DCAE spatial transition &rarr; out_res_block</code>.</li>
+<li><span class="dm c"></span><strong>out_res_block identity shortcut</strong>: after DCAE addition, <code>in_ch == out_ch</code> for this ResBlock since <code>conv_up + pixel_shuffle</code> already mapped to <code>out_ch</code>. No channel projection needed.</li>
+<li><span class="dm y"></span><strong>forward signature</strong>: kept as <code>forward(x, w=None)</code>. Returns <code>(h, None, None)</code> under use_energy_flow=false &mdash; the trailing <code>None</code>s keep the call site in <code>Decoder.forward</code> symmetric with the ef=true branch.</li>
 </ul>
+<p class="src-ref">Source: <code>WFUpBlock</code> in modeling_wfvae2.py</p>
 </div>
 </div>
 </div>
 
-<!-- ===== 6. WAVELET FLOW ===== -->
-<div class="section" id="wavelet-flow">
-<div class="section-title">6. Wavelet Energy Flow <span class="badge badge-block">Wavelet</span></div>
-<div class="section-body">
-
-<div class="mermaid">
-graph LR
-    subgraph ENC["Encoder: Cascading Haar Decomposition"]
-        direction TB
-        IMG["RGB (B, 3, 1024, 1024)"]
-        C0["HaarWT: coeffs0 (B, 12, 512, 512)<br/>LL 3ch + LH 3ch + HL 3ch + HH 3ch"]
-        D0["WFDownBlock 0: HaarWT coeffs0 first3ch<br/>coeffs1: (B, 12, 256, 256)"]
-        D1["WFDownBlock 1: HaarWT coeffs1 first3ch<br/>coeffs2: (B, 12, 128, 128)"]
-        D2["WFDownBlock 2: HaarWT coeffs2 first3ch<br/>coeffs3: (B, 12, 64, 64)"]
-        D3["WFDownBlock 3: HaarWT coeffs3 first3ch<br/>coeffs4: (B, 12, 32, 32)"]
-        IMG --> C0 --> D0 --> D1 --> D2 --> D3
-    end
-
-    subgraph DEC["Decoder: Cascading InvHaar Reconstruction"]
-        direction TB
-        U0["WFUpBlock 0: gen coeffs (B, 12, 32, 32)<br/>InvHaarWT &rarr; w0: (B, 3, 64, 64)"]
-        U1["WFUpBlock 1: coeffs first3ch += w0<br/>InvHaarWT &rarr; w1: (B, 3, 128, 128)"]
-        U2["WFUpBlock 2: coeffs first3ch += w1<br/>InvHaarWT &rarr; w2: (B, 3, 256, 256)"]
-        U3["WFUpBlock 3: coeffs first3ch += w2<br/>InvHaarWT &rarr; w3: (B, 3, 512, 512)"]
-        FINAL["conv_out first3ch += w3<br/>InvHaarWT &rarr; RGB (B, 3, 1024, 1024)"]
-        U0 --> U1 --> U2 --> U3 --> FINAL
-    end
-
-    subgraph LOSS["Wavelet Loss Training"]
-        direction TB
-        WL["wavelet_loss = L1 encoder_coeffs, decoder_coeffs_reversed<br/>Aligns frequency-domain representations<br/>between encoder and decoder"]
-    end
-
-    D3 -.->|"inter_coeffs"| WL
-    U3 -.->|"inter_coeffs"| WL
-
-    style IMG fill:#2d1f4e,stroke:#bc8cff,color:#fff
-    style FINAL fill:#2d1f4e,stroke:#bc8cff,color:#fff
-    style C0 fill:#3d1a4e,stroke:#d29922,color:#fff
-    style D0 fill:#3d1a4e,stroke:#d29922,color:#fff
-    style D1 fill:#3d1a4e,stroke:#d29922,color:#fff
-    style D2 fill:#3d1a4e,stroke:#d29922,color:#fff
-    style D3 fill:#3d1a4e,stroke:#d29922,color:#fff
-    style U0 fill:#1a3a4e,stroke:#39d3ef,color:#fff
-    style U1 fill:#1a3a4e,stroke:#39d3ef,color:#fff
-    style U2 fill:#1a3a4e,stroke:#39d3ef,color:#fff
-    style U3 fill:#1a3a4e,stroke:#39d3ef,color:#fff
-    style FINAL fill:#1a3a4e,stroke:#39d3ef,color:#fff
-    style WL fill:#2d1a1a,stroke:#f85149,color:#fff
-</div>
-
-<div class="callout">
-<h4>Wavelet Flow Mechanism</h4>
-<ul>
-<li><span class="dm y"></span><strong>Encoder</strong>: Builds a multi-level Haar wavelet decomposition tree. At each level, takes the LL sub-band first 3 channels = low-frequency RGB approximation and applies another HaarWT. The resulting 12-channel coefficients are (1) processed by <code>in_flow_conv</code> and concatenated to the spatial trunk, and (2) passed to the next level.</li>
-<li><span class="dm c"></span><strong>Decoder</strong>: Reconstructs the wavelet tree in reverse. Each WFUpBlock generates 12-channel coefficients from latent features, injects previous level LL residual <code>w</code>, then InvHaarWT produces 3-channel RGB image at 2x resolution. This <code>w</code> cascades upward until the final output merge.</li>
-<li><span class="dm r"></span><strong>Wavelet loss</strong>: L1 loss between encoder and decoder coefficients reversed order, weight=0.1. Forces decoder to reconstruct frequency-domain structure consistent with encoder decomposition.</li>
-<li><span class="dm g"></span><strong>No skip connections</strong>: Decoder wavelet flow is entirely self-generated from latent. No encoder coefficients are passed to decoder at inference.</li>
-</ul>
-</div>
-</div>
-</div>
-
-<!-- ===== 7. DISCRIMINATOR & LOSS ===== -->
+<!-- ===== 6. DISCRIMINATOR & LOSS ===== -->
 <div class="section" id="discriminator">
-<div class="section-title">7. Discriminator &amp; Adversarial Loss (pix2pixHD) <span class="badge badge-ov">Training</span></div>
+<div class="section-title">6. Discriminator &amp; Adversarial Loss (pix2pixHD) <span class="badge badge-ov">Training</span></div>
 <div class="section-body">
 
 <p style="color:var(--muted); margin-bottom:1rem; font-size:.9rem;">
-Two discriminator variants coexist — switch via <code>--disc_type {single,multiscale}</code>. The legacy single-scale PatchGAN lives in <code>discriminator.py</code> (untouched); the pix2pixHD-style multi-scale disc + feature-matching loss live in <code>multiscale_discriminator.py</code>.
+Two discriminator variants coexist &mdash; switch via <code>--disc_type {single,multiscale}</code>. The legacy single-scale PatchGAN lives in <code>discriminator.py</code>; the pix2pixHD-style multi-scale disc + feature-matching loss live in <code>multiscale_discriminator.py</code>. <strong>Both variants support four normalization modes</strong> (<code>--disc_norm {sn,bn,in,none}</code>); on this branch the default is <code>sn</code> (Miyato et al., Spectral Normalization, ICLR 2018). This is batch-size independent, crucial at BS=1/1024px.
 </p>
 
-<h3 style="color:var(--purple); margin:1rem 0 .5rem; font-size:1.05rem;">7.1 Training pipeline (generator step)</h3>
+<h3 style="color:var(--purple); margin:1rem 0 .5rem; font-size:1.05rem;">6.1 Training pipeline (generator step)</h3>
 
 <div class="mermaid">
 graph LR
     REAL["real x<br/>(B, 3, H, W)"]
-    VAE["VAE<br/>(Encoder + Decoder)"]
+    VAE["VAE<br/>(Encoder + Decoder)<br/><i>extra_output = None</i>"]
     REC["reconstruction<br/>(B, 3, H, W)"]
-    L1["L1/L2 + LPIPS<br/>→ rec_loss, nll_loss"]
-    KL["posterior KL<br/>→ kl_loss"]
-    WL["wavelet L1<br/>→ wavelet_loss"]
+    L1["L1/L2 + LPIPS<br/>&rarr; rec_loss, nll_loss"]
+    KL["posterior KL<br/>&rarr; kl_loss"]
 
     REAL --> VAE
     VAE --> REC
     VAE -.->|"posteriors"| KL
-    VAE -.->|"enc/dec coeffs"| WL
     REAL --> L1
     REC --> L1
 
@@ -652,7 +503,7 @@ graph LR
 
     subgraph LOSS["Loss computation"]
         GLOSS["g_loss = mean over scales of<br/>-mean(D(rec)[i][-1])"]
-        FMLOSS["fm_loss = λ_feat · Σ_i Σ_j<br/>D_w · feat_w · L1(D(rec)[i][j],<br/>D(real)[i][j].detach())"]
+        FMLOSS["fm_loss = &lambda;_feat &middot; &Sigma;_i &Sigma;_j<br/>D_w &middot; feat_w &middot; L1(D(rec)[i][j],<br/>D(real)[i][j].detach())"]
     end
     D_REC --> GLOSS
     D_REC --> FMLOSS
@@ -662,10 +513,9 @@ graph LR
     GLOSS --> ADAPTIVE
     L1 --> ADAPTIVE
 
-    TOTAL["total_loss =<br/>nll + kl·kl_w + d_w·disc_factor·g_loss<br/>+ wl·wl_w + fm_loss"]
+    TOTAL["total_loss =<br/>nll + kl&middot;kl_w + d_w&middot;disc_factor&middot;g_loss<br/>+ fm_loss<br/><i>(wavelet_weight &middot; wl_loss = 0 under no-ef)</i>"]
     L1 --> TOTAL
     KL --> TOTAL
-    WL --> TOTAL
     ADAPTIVE --> TOTAL
     GLOSS --> TOTAL
     FMLOSS --> TOTAL
@@ -681,15 +531,16 @@ graph LR
 <div class="callout">
 <h4>Pipeline notes</h4>
 <ul>
+<li><span class="dm y"></span><strong>WL loss is inert under no-ef</strong>: <code>WFIVAE2Model.forward</code> returns <code>extra_output=None</code> (not <code>(None, None)</code> &mdash; which would be truthy); the train loop keeps <code>wavelet_coeffs = None</code>; <code>LPIPSWithDiscriminator.forward</code> takes the <code>else</code> branch and sets <code>wl_loss = torch.tensor(0.0)</code>. The CSV column <code>wavelet_loss</code> stays at 0 across the entire run. No code change needed in the loss class or the training loop.</li>
 <li><span class="dm g"></span><strong>Two disc forwards per gen step</strong>: in multiscale mode, the generator step runs D on both reconstruction and real (the latter detached) because feature matching needs paired intermediate features. This adds ~1 extra disc forward compared to single-scale.</li>
 <li><span class="dm c"></span><strong>Adaptive d_weight is untouched</strong>: <code>g_loss</code> is aggregated to a scalar before gradient computation, so <code>calculate_adaptive_weight</code> still sees a single scalar and its logic is identical to single-scale.</li>
-<li><span class="dm y"></span><strong>Feature matching is outside the adaptive weight</strong>: <code>fm_loss</code> uses a fixed <code>λ_feat=10.0</code> multiplier, not the adaptive <code>d_weight</code>. This mirrors pix2pixHD.</li>
+<li><span class="dm y"></span><strong>Feature matching is outside the adaptive weight</strong>: <code>fm_loss</code> uses a fixed <code>&lambda;_feat=10.0</code> multiplier, not the adaptive <code>d_weight</code>. This mirrors pix2pixHD.</li>
 <li><span class="dm r"></span><strong>Alternating gen/disc</strong>: discriminator step is a separate call with <code>optimizer_idx=1</code>, runs <code>D(real.detach())</code> and <code>D(rec.detach())</code> and computes per-scale hinge loss averaged across scales.</li>
 </ul>
-<p class="src-ref">Source: perceptual_loss_2d.py forward() lines ~110-210</p>
+<p class="src-ref">Source: perceptual_loss_2d.py forward() lines ~170-280</p>
 </div>
 
-<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">7.2 MultiscaleDiscriminator (num_D=3)</h3>
+<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">6.2 MultiscaleDiscriminator (num_D=3)</h3>
 
 <div class="mermaid">
 graph TB
@@ -699,13 +550,13 @@ graph TB
     IN --> DS1 --> DS2
 
     subgraph S0["Scale 0 (full res)"]
-        D0["NLayerDiscriminatorWithFeat<br/>5 layers → [l0..l3, logit]"]
+        D0["NLayerDiscriminatorWithFeat<br/>5 layers &rarr; [l0..l3, logit]"]
     end
     subgraph S1["Scale 1 (H/2, W/2)"]
-        D1["NLayerDiscriminatorWithFeat<br/>5 layers → [l0..l3, logit]"]
+        D1["NLayerDiscriminatorWithFeat<br/>5 layers &rarr; [l0..l3, logit]"]
     end
     subgraph S2["Scale 2 (H/4, W/4)"]
-        D2["NLayerDiscriminatorWithFeat<br/>5 layers → [l0..l3, logit]"]
+        D2["NLayerDiscriminatorWithFeat<br/>5 layers &rarr; [l0..l3, logit]"]
     end
 
     IN --> D0
@@ -728,24 +579,24 @@ graph TB
 <h4>Multi-scale design</h4>
 <ul>
 <li><span class="dm g"></span><strong>Independent parameters</strong>: each scale has its own <code>NLayerDiscriminatorWithFeat</code> with independent weights. No weight sharing across scales.</li>
-<li><span class="dm c"></span><strong>Progressive downsampling</strong>: <code>AvgPool2d(3, stride=2, padding=[1,1], count_include_pad=False)</code> between scales. For 1024px input, the three scales see 1024→512→256.</li>
-<li><span class="dm y"></span><strong>Why multi-scale</strong>: a single PatchGAN at full resolution has a limited receptive field (~70×70 for n_layers=3), missing coarse structure at high resolution. Downsampled scales give the disc an explicit "zoom-out" view.</li>
+<li><span class="dm c"></span><strong>Progressive downsampling</strong>: <code>AvgPool2d(3, stride=2, padding=[1,1], count_include_pad=False)</code> between scales. For 1024px input, the three scales see 1024&rarr;512&rarr;256.</li>
+<li><span class="dm y"></span><strong>Why multi-scale</strong>: a single PatchGAN at full resolution has a limited receptive field (~70&times;70 for n_layers=3), missing coarse structure at high resolution. Downsampled scales give the disc an explicit "zoom-out" view.</li>
 <li><span class="dm r"></span><strong>Output convention</strong>: <code>result[0]</code> is full-res, <code>result[num_D-1]</code> is the most downsampled (pix2pixHD uses <code>num_D-1-i</code> indexing internally).</li>
 </ul>
-<p class="src-ref">Source: multiscale_discriminator.py MultiscaleDiscriminator.forward()</p>
+<p class="src-ref">Source: multiscale_discriminator.py <code>MultiscaleDiscriminator.forward()</code></p>
 </div>
 
-<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">7.3 Single PatchGAN internal structure (n_layers=3)</h3>
+<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">6.3 Single PatchGAN internal structure (n_layers=3)</h3>
 
 <div class="mermaid">
 graph TB
     X["input (B, 3, h, w)"]
 
-    M0["model0: Conv(3→64, k=4, s=2) + LReLU(0.2)<br/>(no BatchNorm on first layer)"]
-    M1["model1: Conv(64→128, k=4, s=2) + BN + LReLU"]
-    M2["model2: Conv(128→256, k=4, s=2) + BN + LReLU"]
-    M3["model3: Conv(256→512, k=4, s=1) + BN + LReLU<br/>(penultimate, stride=1)"]
-    M4["model4: Conv(512→1, k=4, s=1)<br/>(final logit, 1-channel)"]
+    M0["model0: SN-Conv(3&rarr;64, k=4, s=2) + LReLU(0.2)<br/>(no norm on first layer)"]
+    M1["model1: SN-Conv(64&rarr;128, k=4, s=2) + Identity + LReLU"]
+    M2["model2: SN-Conv(128&rarr;256, k=4, s=2) + Identity + LReLU"]
+    M3["model3: SN-Conv(256&rarr;512, k=4, s=1) + Identity + LReLU<br/>(penultimate, stride=1)"]
+    M4["model4: SN-Conv(512&rarr;1, k=4, s=1)<br/>(final logit, 1-channel)"]
 
     X --> M0 --> L0["l0<br/>(B, 64, h/2, w/2)"]
     L0 --> M1 --> L1["l1<br/>(B, 128, h/4, w/4)"]
@@ -768,27 +619,27 @@ graph TB
 <div class="callout">
 <h4>PatchGAN details</h4>
 <ul>
-<li><span class="dm g"></span><strong>Normalization</strong>: <code>BatchNorm2d</code> on all layers except model0 (first Conv) and model4 (final logit). Aligns with pix2pixHD original.</li>
-<li><span class="dm c"></span><strong>Penultimate stride change</strong>: model3 uses stride=1 (vs stride=2 elsewhere) so the final receptive field stays moderate (~70×70 effective for n_layers=3).</li>
+<li><span class="dm g"></span><strong>Normalization (default sn)</strong>: every <code>Conv2d</code> is wrapped with <code>spectral_norm</code>; the norm slot between Conv and LReLU is <code>nn.Identity()</code>. State_dict gains <code>weight_orig</code>/<code>weight_u</code>/<code>weight_v</code> keys. Switch via <code>DISC_NORM={sn,bn,in,none}</code>; <code>bn</code> restores the legacy BatchNorm2d behavior (noisy at BS=1/2 in DDP without SyncBN).</li>
+<li><span class="dm c"></span><strong>Penultimate stride change</strong>: model3 uses stride=1 (vs stride=2 elsewhere) so the final receptive field stays moderate (~70&times;70 effective for n_layers=3).</li>
 <li><span class="dm y"></span><strong>Feature extraction</strong>: because each block is registered as <code>self.modelN</code> separately, forward can collect outputs progressively into a list. Without this split, FM loss cannot access intermediate activations.</li>
-<li><span class="dm r"></span><strong>Small-batch concern</strong>: BatchNorm statistics are noisy at BS=2 in DDP (no SyncBN). If 1024px training is unstable, consider porting <code>InstanceNorm2d</code> — left as future work.</li>
+<li><span class="dm r"></span><strong>SN Lipschitz constraint</strong>: spectral_norm normalizes each Conv's weight by its top singular value (power iteration, Ip=1), enforcing a per-layer Lipschitz bound of 1. This yields training stability comparable to WGAN-GP without the gradient-penalty cost.</li>
 </ul>
-<p class="src-ref">Source: multiscale_discriminator.py NLayerDiscriminatorWithFeat</p>
+<p class="src-ref">Source: multiscale_discriminator.py <code>NLayerDiscriminatorWithFeat</code></p>
 </div>
 
-<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">7.4 Loss formulas</h3>
+<h3 style="color:var(--purple); margin:1.5rem 0 .5rem; font-size:1.05rem;">6.4 Loss formulas</h3>
 
 <div style="background:var(--bg); padding:1.2rem; border-radius:8px; border:1px solid var(--border); font-family:ui-monospace,monospace; font-size:.88rem; line-height:1.9; color:var(--text); margin-top:.5rem;">
 <div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Total generator loss</div>
 total_loss = nll_loss / exp(logvar) + logvar<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + kl_weight · kl_loss<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + d_weight · disc_factor · <span style="color:var(--green);">g_loss</span><br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + wavelet_weight · wavelet_loss<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + <span style="color:var(--green);">fm_loss</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);">// ← new in multiscale mode</span>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + kl_weight &middot; kl_loss<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + d_weight &middot; disc_factor &middot; <span style="color:var(--green);">g_loss</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + wavelet_weight &middot; wavelet_loss&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--orange);">// = 0 under use_energy_flow=false</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + <span style="color:var(--green);">fm_loss</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);">// pix2pixHD feature matching</span>
 <br/><br/>
 <div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Multi-scale g_loss (average over scales)</div>
 pred_fake = D(reconstructions)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># List[List[Tensor]]</span><br/>
-g_loss = (1/num_D) · Σ_i [ -mean(pred_fake[i][-1]) ]
+g_loss = (1/num_D) &middot; &Sigma;_i [ -mean(pred_fake[i][-1]) ]
 <br/><br/>
 <div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Feature matching loss (L1 on intermediate features)</div>
 pred_real = D(inputs.detach())&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># extra D forward on real</span><br/>
@@ -798,43 +649,35 @@ D_weights&nbsp;&nbsp;&nbsp; = 1 / num_D&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
 fm_loss = 0<br/>
 for i in range(num_D):&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># all scales</span><br/>
 &nbsp;&nbsp;&nbsp; for j in range(n_layers_D + 1):&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># all layers except final logit</span><br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; fm_loss += D_weights · feat_weights · L1(<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; fm_loss += D_weights &middot; feat_weights &middot; L1(<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; pred_fake[i][j],&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># gradient flows to generator</span><br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; pred_real[i][j].detach()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># real features = frozen target</span><br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; )<br/>
-fm_loss *= feat_match_weight&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># λ_feat = 10.0 (pix2pixHD default)</span>
+fm_loss *= feat_match_weight&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="color:var(--muted);"># &lambda;_feat = 10.0 (pix2pixHD default)</span>
 <br/><br/>
 <div style="color:var(--purple); margin-bottom:.5rem; font-weight:bold;"># Discriminator step — multi-scale hinge loss</div>
 pred_real = D(inputs.detach())<br/>
 pred_fake = D(reconstructions.detach())<br/>
-d_loss = (1/num_D) · Σ_i [ hinge_d_loss(<br/>
+d_loss = (1/num_D) &middot; &Sigma;_i [ hinge_d_loss(<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; pred_real[i][-1], pred_fake[i][-1]<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ) ]<br/>
 <br/>
-<span style="color:var(--muted);"># hinge_d_loss = 0.5 · ( relu(1 - real) + relu(1 + fake) )</span>
+<span style="color:var(--muted);"># hinge_d_loss = 0.5 &middot; ( relu(1 - real) + relu(1 + fake) )</span>
 </div>
 
 <div class="callout">
-<h4>Default values (aggressive route, currently deployed)</h4>
+<h4>Default values (currently deployed)</h4>
 <ul>
+<li><strong>disc_type</strong> = <code>multiscale</code> (pix2pixHD)</li>
+<li><strong>disc_norm</strong> = <code>sn</code> (Spectral Normalization &mdash; batch-size independent)</li>
 <li><strong>num_D</strong> = 3 (scales: full-res, /2, /4)</li>
 <li><strong>n_layers_D</strong> = 3 (conv depth per PatchGAN)</li>
 <li><strong>ndf</strong> = 64 (base disc channel count)</li>
-<li><strong>feat_match_weight</strong> (λ_feat) = 10.0</li>
-<li><strong>disc_weight</strong> = 0.5 (unchanged)</li>
-<li><strong>disc_loss</strong> = "hinge" (unchanged)</li>
-<li><strong>disc_start</strong> = 5 (unchanged — disc activates from step 5 onward)</li>
-<li><strong>Disc params</strong>: single-scale 2.77 M → multi-scale <strong>8.30 M</strong> (~3×)</li>
-</ul>
-</div>
-
-<div class="callout">
-<h4>Coexistence — not a replacement</h4>
-<ul>
-<li><span class="dm g"></span>The original <code>NLayerDiscriminator</code> in <code>discriminator.py</code> is <strong>untouched</strong>. Run <code>DISC_TYPE=single bash train_wfivae.sh</code> to use it and get identical behavior to pre-patch runs.</li>
-<li><span class="dm c"></span><code>train_wfivae.sh</code> auto-suffixes <code>EXP_NAME</code> with <code>_single</code>/<code>_multiscale</code>, so checkpoints and CSV from the two variants live in disjoint output directories and can be trained side-by-side.</li>
-<li><span class="dm r"></span>Checkpoints are <strong>not cross-compatible</strong> (param shapes differ). Resuming with the wrong <code>disc_type</code> raises a PyTorch shape-mismatch at load time.</li>
-<li><span class="dm y"></span>Ablation knobs: <code>FEAT_MATCH_WEIGHT=0</code> disables FM loss while keeping the multi-scale GAN loss; <code>NUM_D=2</code> drops to 2 scales to save memory.</li>
+<li><strong>feat_match_weight</strong> (&lambda;_feat) = 10.0</li>
+<li><strong>disc_weight</strong> = 0.5</li>
+<li><strong>disc_loss</strong> = "hinge"</li>
+<li><strong>disc_start</strong> = 5 (disc activates from step 5 onward)</li>
+<li><strong>Disc params</strong>: single-scale 2.77 M &rarr; multi-scale <strong>8.30 M</strong> (~3&times;)</li>
 </ul>
 </div>
 

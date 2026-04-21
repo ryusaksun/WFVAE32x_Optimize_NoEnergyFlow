@@ -293,9 +293,12 @@ class LPIPSWithDiscriminator(nn.Module):
                 logits_real_mean = logits_real.detach().mean()
                 logits_fake_mean = logits_fake.detach().mean()
 
-            disc_factor = adopt_weight(
-                self.disc_factor, global_step, threshold=self.discriminator_iter_start
-            )
+            # Discriminator trains from step 0 regardless of `discriminator_iter_start`
+            # (the latter only gates the *generator*'s GAN loss). Pre-switch, the
+            # discriminator warms up on real / L1-only-reconstruction pairs so its
+            # outputs are calibrated when the generator starts pulling adversarial
+            # gradient through it.
+            disc_factor = self.disc_factor
             d_loss = disc_factor * d_loss_raw
 
             log = {

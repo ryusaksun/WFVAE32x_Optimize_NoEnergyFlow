@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from .eca import ECALayer
 from .normalize import Normalize
 from .ops import nonlinearity, video_to_image
 
@@ -13,6 +14,7 @@ class ResnetBlock2D(nn.Module):
         conv_shortcut=False,
         norm_type,
         dropout,
+        use_eca: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -28,6 +30,7 @@ class ResnetBlock2D(nn.Module):
         self.conv2 = torch.nn.Conv2d(
             out_channels, out_channels, kernel_size=3, stride=1, padding=1
         )
+        self.eca = ECALayer(self.out_channels) if use_eca else None
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = torch.nn.Conv2d(
@@ -48,6 +51,8 @@ class ResnetBlock2D(nn.Module):
         h = nonlinearity(h)
         h = self.dropout(h)
         h = self.conv2(h)
+        if self.eca is not None:
+            h = self.eca(h)
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 x = self.conv_shortcut(x)

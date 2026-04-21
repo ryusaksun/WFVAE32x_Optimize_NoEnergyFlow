@@ -36,6 +36,38 @@
 set -e  # 遇到错误立即退出
 
 # ============================================
+# 捕获用户实际设置的环境变量前缀，供 README.md 记录原始调用命令
+# 必须放在所有 ${VAR:-default} 之前，否则会把默认值误当成用户设置
+# ============================================
+_WFVAE_ENV_VARS=(
+    GPU RESOLUTION BATCH_SIZE EVAL_BATCH_SIZE LR DISC_LR GRAD_ACCUM_STEPS
+    EPOCHS MAX_STEPS SAVE_CKPT_STEP EVAL_STEPS EVAL_SUBSET_SIZE EVAL_NUM_IMAGE_LOG
+    CSV_LOG_STEPS LOG_STEPS DATASET_NUM_WORKER EXP_NAME MODEL_CONFIG
+    WANDB_PROJECT DISABLE_WANDB MASTER_PORT
+    ADAPTIVE_WEIGHT_CLAMP MIX_PRECISION LEARN_LOGVAR LOGVAR_LR
+    DISC_TYPE NUM_D N_LAYERS_D FEAT_MATCH_WEIGHT DISC_NORM
+    RESUME_CKPT ORIGINAL_MANIFEST VAL_MANIFEST OUTPUT_DIR TRAIN_RATIO
+)
+# 简化的 shell quoting: 常规值原样, 含特殊字符时回退到 printf %q
+_wfvae_quote() {
+    local _val="$1"
+    if [[ "$_val" =~ ^[A-Za-z0-9_,.:/=+@\-]*$ ]]; then
+        printf '%s' "$_val"
+    else
+        printf '%q' "$_val"
+    fi
+}
+_WFVAE_ENV_PREFIX=""
+for _v in "${_WFVAE_ENV_VARS[@]}"; do
+    if declare -p "$_v" >/dev/null 2>&1; then
+        _WFVAE_ENV_PREFIX+="$_v=$(_wfvae_quote "${!_v}") "
+    fi
+done
+export WFVAE_LAUNCH_CMD="${_WFVAE_ENV_PREFIX}bash $(basename "${BASH_SOURCE[0]}")"
+unset _WFVAE_ENV_VARS _WFVAE_ENV_PREFIX _v
+unset -f _wfvae_quote
+
+# ============================================
 # Conda 环境激活（根据需要取消注释）
 # ============================================
 # source ~/anaconda3/etc/profile.d/conda.sh
@@ -137,7 +169,7 @@ fi
 # 训练/验证步频与日志配置（可通过环境变量覆盖）
 EPOCHS="${EPOCHS:-1000}"
 MAX_STEPS="${MAX_STEPS:-}"
-SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-50000}"
+SAVE_CKPT_STEP="${SAVE_CKPT_STEP:-10000}"
 EVAL_STEPS="${EVAL_STEPS:-1000}"
 EVAL_SUBSET_SIZE="${EVAL_SUBSET_SIZE:-30}"     # 验证子集大小，0 表示使用完整验证集
 EVAL_NUM_IMAGE_LOG="${EVAL_NUM_IMAGE_LOG:-20}"  # 验证重建图样本数量
@@ -147,19 +179,19 @@ DATASET_NUM_WORKER="${DATASET_NUM_WORKER:-8}"
 
 # 模型配置与 batch size（32x 配置与分辨率解耦，两种分辨率共用同一 config）
 DEFAULT_MODEL_CONFIG="examples/wfivae2-image-32x-192bc.json"
-DEFAULT_EXP_NAME="${PROJECT_NAME}_${DISC_TYPE}_${DISC_NORM}"
 
 if [ "$RESOLUTION" = "1024" ]; then
-    BATCH_SIZE="${BATCH_SIZE:-2}"
-    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
+    BATCH_SIZE="${BATCH_SIZE:-1}"
+    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+    DEFAULT_GRAD_ACCUM_STEPS=4
 else
     # 256
     BATCH_SIZE="${BATCH_SIZE:-8}"
     EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
+    DEFAULT_GRAD_ACCUM_STEPS=1
 fi
 
 MODEL_CONFIG="${MODEL_CONFIG:-$DEFAULT_MODEL_CONFIG}"
-EXP_NAME="${EXP_NAME:-$DEFAULT_EXP_NAME}"
 
 # 训练集比例 (默认 0.9)
 TRAIN_RATIO="${TRAIN_RATIO:-0.9}"
@@ -174,7 +206,8 @@ LR="${LR:-1e-5}"
 DISC_LR="${DISC_LR:-$LR}"
 
 # 梯度累积步数（等效增大 batch size，不增加显存）
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+# 默认与分辨率绑定：1024 → 4，256 → 1
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-$DEFAULT_GRAD_ACCUM_STEPS}"
 
 # 自适应权重 clamp 上限（控制判别器对生成器的最大影响力）
 # 默认 1e6（原始值），降低可减少判别器过强导致的伪影
@@ -199,6 +232,33 @@ FEAT_MATCH_WEIGHT="${FEAT_MATCH_WEIGHT:-10.0}"  # pix2pixHD feature-matching los
 # 判别器归一化（Miyato et al. 2018 Spectral Normalization 等）
 # ============================================
 DISC_NORM="${DISC_NORM:-sn}"                    # sn (默认，谱归一化) | bn (BatchNorm2d) | in (InstanceNorm) | none
+
+# ============================================
+# 实验名后缀 (依赖 DISC_TYPE / DISC_NORM / MODEL_CONFIG 都已就位)
+# 一次加载 JSON,同时派生 _eca / _classic / _noef 三个后缀
+# (默认 MODEL_CONFIG 是 DCAE+energy_flow 变种 → 不带 _classic / _noef 后缀;
+#  切到 classic 变种 (MODEL_CONFIG=...-classic.json) 时加 _classic;
+#  切到 no-energy-flow 变种 (MODEL_CONFIG=...-noef.json) 时加 _noef;
+#  use_eca=false 时不加 _eca 后缀)
+# ============================================
+read -r ECA_SUFFIX BLOCK_TYPE_SUFFIX EF_SUFFIX < <(python3 -c "
+import json
+try:
+    with open('$MODEL_CONFIG') as f:
+        c = json.load(f)
+    eca = '_eca' if c.get('use_eca', False) else '-'
+    bt = '_classic' if c.get('block_type', 'dcae') == 'classic' else '-'
+    ef = '-' if c.get('use_energy_flow', True) else '_noef'
+    print(eca, bt, ef)
+except Exception:
+    print('- - -')
+" 2>/dev/null)
+# 用 '-' 占位是为了让 \`read\` 能分成三个 token;下面再还原空字符串
+[ "$ECA_SUFFIX" = "-" ] && ECA_SUFFIX=""
+[ "$BLOCK_TYPE_SUFFIX" = "-" ] && BLOCK_TYPE_SUFFIX=""
+[ "$EF_SUFFIX" = "-" ] && EF_SUFFIX=""
+DEFAULT_EXP_NAME="${PROJECT_NAME}_${DISC_TYPE}_${DISC_NORM}${ECA_SUFFIX}${BLOCK_TYPE_SUFFIX}${EF_SUFFIX}"
+EXP_NAME="${EXP_NAME:-$DEFAULT_EXP_NAME}"
 
 # ============================================
 # 创建输出目录
@@ -450,7 +510,7 @@ TRAIN_ARGS=(
     --eval_lpips
     --mix_precision "$MIX_PRECISION"
     --disc_cls causalimagevae.model.losses.LPIPSWithDiscriminator
-    --disc_start 5
+    --disc_start 80000
     --disc_weight 0.5
     --disc_lr "$DISC_LR"
     --adaptive_weight_clamp "$ADAPTIVE_WEIGHT_CLAMP"

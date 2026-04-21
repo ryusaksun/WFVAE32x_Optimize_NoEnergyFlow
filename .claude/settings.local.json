@@ -48,7 +48,11 @@
       "Bash(DISC_TYPE=multiscale NUM_D=3 bash -c 'source train_wfivae.sh 2>&1 | grep -E \"判别器|实验名称\" | head -5')",
       "Read(//Users/ryuichi/Desktop/WFVAE_CODE/pix2pixHD/**)",
       "Read(//Users/ryuichi/Desktop/WFVAE_CODE/pix2pixHD/models/**)",
-      "Read(//Users/ryuichi/Desktop/WFVAE_CODE/sngan_projection/**)"
+      "Read(//Users/ryuichi/Desktop/WFVAE_CODE/sngan_projection/**)",
+      "Read(//Users/ryuichi/Desktop/WFVAE_CODE/ECANet/**)",
+      "Bash(/bin/bash --version)",
+      "Bash(/bin/bash -c ':*)",
+      "Bash(awk -F',' '{printf \\\\\"step=%s  psnr=%s  lpips=%s\\\\n\\\\\", \\\\$1, \\\\$16, \\\\$17}'\")"
     ]
   }
 }

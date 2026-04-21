@@ -55,6 +55,10 @@ def load_config(config_path):
         "decoder_num_resblocks": cfg.get("decoder_num_resblocks", 3),
         "decoder_energy_flow_size": cfg.get("decoder_energy_flow_size", 128),
         "norm_type": cfg.get("norm_type", "groupnorm"),
+        "block_type": cfg.get("block_type", "dcae"),
+        "use_io_shortcut": cfg.get("use_io_shortcut", False),
+        "use_eca": cfg.get("use_eca", False),
+        "use_energy_flow": cfg.get("use_energy_flow", True),
     }
 
 
@@ -72,6 +76,10 @@ def test_model_creation(p):
         decoder_num_resblocks=p["decoder_num_resblocks"],
         decoder_energy_flow_size=p["decoder_energy_flow_size"],
         norm_type=p["norm_type"],
+        block_type=p["block_type"],
+        use_io_shortcut=p["use_io_shortcut"],
+        use_eca=p["use_eca"],
+        use_energy_flow=p["use_energy_flow"],
     )
 
     total_params = sum(v.numel() for v in model.parameters())
@@ -115,13 +123,16 @@ def test_forward_pass(model, p, resolution):
     assert out.latent_dist.mean.shape == (1, latent_dim, expected_latent_size, expected_latent_size), \
         f"潜在形状错误: {out.latent_dist.mean.shape}, 预期 (1, {latent_dim}, {expected_latent_size}, {expected_latent_size})"
 
-    assert out.extra_output is not None, "WFIVAE2应有extra_output用于小波损失"
-    enc_coeffs, dec_coeffs = out.extra_output
-    print(f"编码器小波系数数量: {len(enc_coeffs)} (应为{num_down})")
-    print(f"解码器小波系数数量: {len(dec_coeffs)} (应为{num_down})")
-
-    assert len(enc_coeffs) == num_down, f"编码器系数数量错误: {len(enc_coeffs)}"
-    assert len(dec_coeffs) == num_down, f"解码器系数数量错误: {len(dec_coeffs)}"
+    if p["use_energy_flow"]:
+        assert out.extra_output is not None, "use_energy_flow=True 时 extra_output 不应为 None"
+        enc_coeffs, dec_coeffs = out.extra_output
+        print(f"编码器小波系数数量: {len(enc_coeffs)} (应为{num_down})")
+        print(f"解码器小波系数数量: {len(dec_coeffs)} (应为{num_down})")
+        assert len(enc_coeffs) == num_down, f"编码器系数数量错误: {len(enc_coeffs)}"
+        assert len(dec_coeffs) == num_down, f"解码器系数数量错误: {len(dec_coeffs)}"
+    else:
+        assert out.extra_output is None, "use_energy_flow=False 时 extra_output 必须为 None(避免下游 WL loss 分支误触发)"
+        print("use_energy_flow=False → extra_output is None ✓")
 
     print(f"✓ 前向传播测试通过 ({resolution} 分辨率)")
     return out
@@ -144,8 +155,12 @@ def test_encode_decode(model, p, resolution):
         print(f"编码输入: {x.shape}")
         print(f"潜在变量: {z.shape}")
 
-        assert enc_out.extra_output is not None, "编码器应有extra_output"
-        print(f"编码器小波系数: {len(enc_out.extra_output)} 层")
+        if p["use_energy_flow"]:
+            assert enc_out.extra_output is not None, "use_energy_flow=True 时编码器应有 extra_output"
+            print(f"编码器小波系数: {len(enc_out.extra_output)} 层")
+        else:
+            assert enc_out.extra_output is None, "use_energy_flow=False 时编码器 extra_output 必须为 None"
+            print("use_energy_flow=False → 编码器 extra_output is None ✓")
 
         dec_out = model.decode(z)
         print(f"解码输出: {dec_out.sample.shape}")
@@ -250,6 +265,10 @@ def test_wavelet_coeffs_structure(model, p):
     print("测试: 小波系数结构测试")
     print("=" * 60)
 
+    if not p["use_energy_flow"]:
+        print("use_energy_flow=False → 跳过中间层小波系数结构测试")
+        return
+
     model.eval()
     x = torch.randn(1, 3, resolution, resolution)
 
@@ -286,6 +305,10 @@ def test_wavelet_loss_computation(p):
     print(f"\n{'=' * 60}")
     print("测试: 小波损失计算模拟")
     print("=" * 60)
+
+    if not p["use_energy_flow"]:
+        print("use_energy_flow=False → 跳过 WL loss 计算测试(extra_output is None)")
+        return
 
     model = WFIVAE2Model(
         latent_dim=p["latent_dim"],
@@ -356,9 +379,14 @@ def test_dimension_flow(model, p):
         for i, down_block in enumerate(model.encoder.down_blocks):
             h, w = down_block(h, w)
             expected_h, expected_w = expected_shapes[i]
-            print(f"WFDownBlock{i+1}: h={h.shape}, w={w.shape}")
-            assert h.shape == expected_h, f"down_block{i+1} h形状错误: {h.shape} != {expected_h}"
-            assert w.shape == expected_w, f"down_block{i+1} w形状错误: {w.shape} != {expected_w}"
+            if p["use_energy_flow"]:
+                print(f"WFDownBlock{i+1}: h={h.shape}, w={w.shape}")
+                assert h.shape == expected_h, f"down_block{i+1} h形状错误: {h.shape} != {expected_h}"
+                assert w.shape == expected_w, f"down_block{i+1} w形状错误: {w.shape} != {expected_w}"
+            else:
+                print(f"WFDownBlock{i+1}: h={h.shape}, w=None (noef)")
+                assert h.shape == expected_h, f"down_block{i+1} h形状错误: {h.shape} != {expected_h}"
+                assert w is None, f"down_block{i+1} noef 模式下 w 必须为 None"
 
         # mid + output
         h = model.encoder.mid(h)
@@ -398,9 +426,14 @@ def test_dimension_flow(model, p):
         for i, up_block in enumerate(model.decoder.up_blocks):
             h, w, coeffs = up_block(h, w)
             expected_h, expected_w = expected_up_shapes[i]
-            print(f"WFUpBlock{i+1}: h={h.shape}, w={w.shape}")
-            assert h.shape == expected_h, f"up_block{i+1} h形状错误: {h.shape} != {expected_h}"
-            assert w.shape == expected_w, f"up_block{i+1} w形状错误: {w.shape} != {expected_w}"
+            if p["use_energy_flow"]:
+                print(f"WFUpBlock{i+1}: h={h.shape}, w={w.shape}")
+                assert h.shape == expected_h, f"up_block{i+1} h形状错误: {h.shape} != {expected_h}"
+                assert w.shape == expected_w, f"up_block{i+1} w形状错误: {w.shape} != {expected_w}"
+            else:
+                print(f"WFUpBlock{i+1}: h={h.shape}, w=None, coeffs=None (noef)")
+                assert h.shape == expected_h, f"up_block{i+1} h形状错误: {h.shape} != {expected_h}"
+                assert w is None and coeffs is None, f"up_block{i+1} noef 模式下 w/coeffs 必须为 None"
 
         # output
         h = model.decoder.norm_out(h)
@@ -465,12 +498,14 @@ def main():
 
     p = load_config(args.config)
 
+    ef_tag = "concat能量流融合" if p["use_energy_flow"] else "无中间层能量流(W^(1) HaarWT 保留)"
     print("\n" + "=" * 60)
     print("WFIVAE2 图像VAE 单元测试")
-    print(f"({p['num_down_blocks']}层WFDownBlock/WFUpBlock, concat能量流融合, {p['compression_ratio']}x压缩)")
+    print(f"({p['num_down_blocks']}层WFDownBlock/WFUpBlock, {ef_tag}, {p['compression_ratio']}x压缩)")
     print(f"配置: {args.config}")
     print(f"base_channels: {p['base_channels']}")
     print(f"latent_dim: {p['latent_dim']}")
+    print(f"use_energy_flow: {p['use_energy_flow']}")
     print("=" * 60)
 
     try:
@@ -501,14 +536,19 @@ def main():
         print("✓ 所有测试通过!")
         print("=" * 60)
         print(f"\n架构验证:")
-        print(f"  - {num_down}层 WFDownBlock (concat能量流融合)")
-        print(f"  - {num_down}层 WFUpBlock (outflow能量流重建)")
-        print(f"  - {cr}x空间压缩 (小波2x × 下采样{cr // 2}x ({num_down}个DownBlock))")
+        if p["use_energy_flow"]:
+            print(f"  - {num_down}层 WFDownBlock (concat能量流融合)")
+            print(f"  - {num_down}层 WFUpBlock (outflow能量流重建)")
+            print(f"  - 小波损失: {num_down}个部分 (对应{num_down}个下采样层)")
+        else:
+            print(f"  - {num_down}层 WFDownBlock (无中间层能量流,纯主干)")
+            print(f"  - {num_down}层 WFUpBlock (无中间层能量流,纯主干)")
+            print(f"  - 中间层 WL loss 已禁用 (extra_output is None)")
+        print(f"  - {cr}x空间压缩 (W^(1) 小波2x × 下采样{cr // 2}x ({num_down}个DownBlock))")
         for res in [256, 512, 1024]:
             if res % cr == 0:
                 ls = res // cr
                 print(f"  - {res}: latent [{latent_dim}, {ls}, {ls}]")
-        print(f"  - 小波损失: {num_down}个部分 (对应{num_down}个下采样层)")
         print(f"  - 解码器独立重建，无skip connection")
 
     except Exception as e:
